@@ -36,6 +36,59 @@ class LauncherTest(unittest.TestCase):
         config = launcher._build_config(args)
 
         self.assertEqual(config.cache_dtype, "fp8_e4m3")
+        self.assertEqual((config.num_subspaces, config.subspace_dim), (4, 16))
+
+    def test_build_config_auto_resolves_small_head_dim_subspaces(self) -> None:
+        parser = launcher._make_parser()
+        args = parser.parse_args(
+            [
+                "bench",
+                "--hidden-dim",
+                "16",
+                "--num-heads",
+                "4",
+                "--num-kv-heads",
+                "4",
+                "--head-dim",
+                "4",
+                "--num-layers",
+                "1",
+                "--vocab-size",
+                "128",
+            ]
+        )
+
+        config = launcher._build_config(args)
+
+        self.assertEqual((config.num_subspaces, config.subspace_dim), (1, 4))
+
+    def test_build_config_accepts_explicit_subspace_override(self) -> None:
+        parser = launcher._make_parser()
+        args = parser.parse_args(
+            [
+                "bench",
+                "--hidden-dim",
+                "256",
+                "--num-heads",
+                "2",
+                "--num-kv-heads",
+                "2",
+                "--head-dim",
+                "128",
+                "--num-subspaces",
+                "16",
+                "--subspace-dim",
+                "8",
+                "--num-layers",
+                "1",
+                "--vocab-size",
+                "128",
+            ]
+        )
+
+        config = launcher._build_config(args)
+
+        self.assertEqual((config.num_subspaces, config.subspace_dim), (16, 8))
 
     def test_check_command_uses_cache_dtype(self) -> None:
         parser = launcher._make_parser()

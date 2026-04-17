@@ -65,14 +65,50 @@ from .tokenizer_utils import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _resolve_subspace_layout(
+    head_dim: int,
+    num_subspaces: Optional[int],
+    subspace_dim: Optional[int],
+) -> tuple[int, int]:
+    """Resolve a valid PQ subspace layout for the requested head size."""
+    if num_subspaces is None and subspace_dim is None:
+        for candidate_subspace_dim in (16, 8, 4, 2, 1):
+            if head_dim % candidate_subspace_dim == 0:
+                return head_dim // candidate_subspace_dim, candidate_subspace_dim
+        raise ValueError(f"Could not resolve a valid subspace layout for head_dim={head_dim}")
+
+    if num_subspaces is None:
+        assert subspace_dim is not None
+        if head_dim % subspace_dim != 0:
+            raise ValueError(
+                f"head_dim ({head_dim}) must be divisible by subspace_dim ({subspace_dim})"
+            )
+        return head_dim // subspace_dim, subspace_dim
+
+    if subspace_dim is None:
+        if head_dim % num_subspaces != 0:
+            raise ValueError(
+                f"head_dim ({head_dim}) must be divisible by num_subspaces ({num_subspaces})"
+            )
+        return num_subspaces, head_dim // num_subspaces
+
+    return num_subspaces, subspace_dim
+
 def _build_config(args: argparse.Namespace) -> RFSNConfig:
     """Construct an ``RFSNConfig`` from parsed CLI arguments."""
+    num_subspaces, subspace_dim = _resolve_subspace_layout(
+        args.head_dim,
+        getattr(args, "num_subspaces", None),
+        getattr(args, "subspace_dim", None),
+    )
     return RFSNConfig(
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
         num_kv_heads=getattr(args, "num_kv_heads", 0),
         head_dim=args.head_dim,
         num_layers=args.num_layers,
+        num_subspaces=num_subspaces,
+        subspace_dim=subspace_dim,
         vocab_size=args.vocab_size,
         hot_capacity=getattr(args, "hot_capacity", 512),
         warm_capacity=getattr(args, "warm_capacity", 2048),
@@ -237,6 +273,18 @@ def _make_parser() -> argparse.ArgumentParser:
         p.add_argument("--num-kv-heads", type=int, default=0,
                        help="KV heads for GQA (0 = same as num-heads)")
         p.add_argument("--head-dim", type=int, default=64)
+        p.add_argument(
+            "--num-subspaces",
+            type=int,
+            default=None,
+            help="PQ subspace count (auto-resolved from --head-dim when omitted)",
+        )
+        p.add_argument(
+            "--subspace-dim",
+            type=int,
+            default=None,
+            help="PQ subspace dimension (auto-resolved from --head-dim when omitted)",
+        )
         p.add_argument("--num-layers", type=int, default=4)
         p.add_argument("--vocab-size", type=int, default=50000)
         p.add_argument("--hot-capacity", type=int, default=512)
