@@ -103,7 +103,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
         prompt_ids = mx.array([ids], dtype=mx.int32)
 
     print(f"[generate] Prompt length: {prompt_ids.shape[1]} tokens")
-    token_ids = model.generate(
+    generated = model.generate(
         prompt_ids,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
@@ -111,6 +111,17 @@ def cmd_generate(args: argparse.Namespace) -> None:
         top_k=args.top_k,
         repetition_penalty=args.repetition_penalty,
     )
+    if isinstance(generated, list):
+        if generated:
+            token_ids = mx.concatenate(
+                [prompt_ids] + [token[:, None] for token in generated],
+                axis=1,
+            )
+        else:
+            token_ids = prompt_ids
+    else:
+        token_ids = generated
+
     print(f"[generate] Generated {token_ids.shape[1] - prompt_ids.shape[1]} new tokens")
     print(f"[generate] Output IDs: {token_ids[0].tolist()}")
 

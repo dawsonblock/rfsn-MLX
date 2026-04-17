@@ -69,3 +69,49 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(seen["model_cache_dtype"], "fp8_e4m3")
         self.assertIn("cache_dtype=fp8_e4m3", stdout)
         self.assertIn("[check] PASS", stdout)
+
+    def test_generate_command_materializes_sequence_from_generated_steps(self) -> None:
+        parser = launcher._make_parser()
+        args = parser.parse_args(
+            [
+                "generate",
+                "--prompt-ids",
+                "1,2",
+                "--max-new-tokens",
+                "2",
+            ]
+        )
+
+        class FakeCache:
+            def __init__(self, config, batch_size: int) -> None:
+                self.config = config
+                self.batch_size = batch_size
+
+        class FakeModel:
+            def __init__(self, config) -> None:
+                self.config = config
+
+            def generate(
+                self,
+                prompt_ids,
+                max_new_tokens: int,
+                cache=None,
+                temperature: float = 1.0,
+                top_p: float = 1.0,
+                top_k: int = 0,
+                repetition_penalty: float = 1.0,
+            ):
+                return [
+                    mx.array([3], dtype=mx.int32),
+                    mx.array([4], dtype=mx.int32),
+                ]
+
+        output = io.StringIO()
+        with patch("rfsn_v10_5.launcher.RFSNMLX", FakeModel), patch(
+            "rfsn_v10_5.launcher.RFSNCache", FakeCache
+        ), redirect_stdout(output):
+            launcher.cmd_generate(args)
+
+        stdout = output.getvalue()
+        self.assertIn("[generate] Generated 2 new tokens", stdout)
+        self.assertIn("[generate] Output IDs: [1, 2, 3, 4]", stdout)
