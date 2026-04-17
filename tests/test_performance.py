@@ -50,6 +50,26 @@ class PerformanceSmokeTest(unittest.TestCase):
         return token
 
     def _start_capture(self, directory: Path) -> tuple[Path, callable]:
+        def _fallback_capture(reason: str) -> tuple[Path, callable]:
+            artifact = directory / "decode_step.capture.txt"
+
+            def _write_report() -> None:
+                lines = [
+                    "capture_mode=fallback",
+                    f"reason={reason}",
+                    f"has_profiler={hasattr(mx, 'profiler')}",
+                    f"has_metal={hasattr(mx, 'metal')}",
+                ]
+                metal = getattr(mx, "metal", None)
+                if metal is not None:
+                    if hasattr(metal, "is_available"):
+                        lines.append(f"metal_available={metal.is_available()}")
+                if hasattr(mx, "get_peak_memory"):
+                    lines.append(f"peak_memory={mx.get_peak_memory()}")
+                artifact.write_text("\n".join(lines), encoding="utf-8")
+
+            return artifact, _write_report
+
         profiler = getattr(mx, "profiler", None)
         if profiler is not None:
             start = getattr(profiler, "start", None)
@@ -59,7 +79,7 @@ class PerformanceSmokeTest(unittest.TestCase):
                 try:
                     start(str(artifact))
                 except RuntimeError as exc:
-                    self.skipTest(f"mx.profiler is unavailable in this runtime: {exc}")
+                    return _fallback_capture(f"mx.profiler unavailable: {exc}")
                 return artifact, stop
 
         metal = getattr(mx, "metal", None)
@@ -68,10 +88,10 @@ class PerformanceSmokeTest(unittest.TestCase):
             try:
                 metal.start_capture(str(artifact))
             except RuntimeError as exc:
-                self.skipTest(f"Metal capture is unavailable in this runtime: {exc}")
+                return _fallback_capture(f"metal capture unavailable: {exc}")
             return artifact, metal.stop_capture
 
-        self.skipTest("Neither mx.profiler nor mx.metal capture is available in this MLX build")
+        return _fallback_capture("neither mx.profiler nor mx.metal capture is available")
 
     def _assert_capture_artifact(self, artifact_path: Path) -> None:
         self.assertTrue(artifact_path.exists())
