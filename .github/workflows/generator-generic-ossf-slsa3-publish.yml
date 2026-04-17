@@ -48,11 +48,18 @@ jobs:
         id: hash
         run: |
           set -euo pipefail
+          shopt -s nullglob
 
-          # List the artifacts the provenance will refer to.
-          files=$(ls artifact*)
+          # List the artifacts the provenance will refer to in a deterministic order.
+          files=(artifact*)
+          mapfile -t files < <(printf '%s\n' "${files[@]}" | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No artifacts matched artifact*" >&2
+            exit 1
+          fi
+
           # Generate the subjects (base64 encoded).
-          echo "hashes=$(sha256sum $files | base64 -w0)" >> "${GITHUB_OUTPUT}"
+          echo "hashes=$(sha256sum "${files[@]}" | base64 -w0)" >> "${GITHUB_OUTPUT}"
 
   provenance:
     needs: [build]
