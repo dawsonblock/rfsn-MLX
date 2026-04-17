@@ -154,7 +154,7 @@ class RFSNLayerMLX(nn.Module):
         Hkv  = config.num_kv_heads
         D    = config.head_dim
         hidden  = config.hidden_dim
-        ffn_dim = hidden * config.ffn_multiplier
+        ffn_dim = config.ffn_dim
 
         # Projections
         self.q_proj = nn.Linear(hidden, H * D,   bias=False)

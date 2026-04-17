@@ -110,6 +110,8 @@ def _build_config(args: argparse.Namespace) -> RFSNConfig:
         num_subspaces=num_subspaces,
         subspace_dim=subspace_dim,
         vocab_size=args.vocab_size,
+        rope_base=getattr(args, "rope_base", 10000.0),
+        ffn_dim=getattr(args, "ffn_dim", 0),
         hot_capacity=getattr(args, "hot_capacity", 512),
         warm_capacity=getattr(args, "warm_capacity", 2048),
         cold_capacity=getattr(args, "cold_capacity", 8192),
@@ -287,6 +289,18 @@ def _make_parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--num-layers", type=int, default=4)
         p.add_argument("--vocab-size", type=int, default=50000)
+        p.add_argument(
+            "--rope-base",
+            type=float,
+            default=10000.0,
+            help="RoPE theta/base value used by the checkpoint",
+        )
+        p.add_argument(
+            "--ffn-dim",
+            type=int,
+            default=0,
+            help="Explicit FFN hidden size (defaults to hidden_dim * ffn_multiplier)",
+        )
         p.add_argument("--hot-capacity", type=int, default=512)
         p.add_argument("--warm-capacity", type=int, default=2048)
         p.add_argument("--cold-capacity", type=int, default=8192)
@@ -305,7 +319,7 @@ def _make_parser() -> argparse.ArgumentParser:
     gen = sub.add_parser("generate", help="Generate text from a prompt")
     _add_model_args(gen)
     gen.add_argument("--checkpoint", type=str, default=None,
-                     help="Path to .safetensors or .npz checkpoint")
+                     help="Path to a checkpoint file, sharded index, or model directory")
     gen.add_argument("--prompt", type=str, default="Hello",
                      help="Text prompt (tokenizer-backed when --tokenizer is set)")
     gen.add_argument("--prompt-ids", type=str, default=None,
@@ -343,7 +357,7 @@ def _make_parser() -> argparse.ArgumentParser:
     srv = sub.add_parser("serve", help="Run the FastAPI inference wrapper")
     _add_model_args(srv)
     srv.add_argument("--checkpoint", type=str, default=None,
-                     help="Path to .safetensors or .npz checkpoint")
+                     help="Path to a checkpoint file, sharded index, or model directory")
     srv.add_argument("--tokenizer", type=str, default=None,
                      help="HuggingFace tokenizer name or local path for text encode/decode")
     srv.add_argument("--host", type=str, default="127.0.0.1")

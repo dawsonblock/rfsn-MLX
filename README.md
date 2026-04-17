@@ -154,7 +154,7 @@ Treat those numbers as sanity-check output, not a throughput claim for real mode
 
 ```bash
 python -m rfsn_v10_5.launcher generate \
-  --checkpoint /path/to/model.safetensors \
+  --checkpoint /path/to/model-or-directory \
   --tokenizer /path/to/tokenizer-or-hf-id \
   --hidden-dim 4096 \
   --num-heads 32 \
@@ -162,6 +162,8 @@ python -m rfsn_v10_5.launcher generate \
   --head-dim 128 \
   --num-layers 32 \
   --vocab-size 32000 \
+  --ffn-dim 14336 \
+  --rope-base 500000 \
   --prompt "Once upon a time" \
   --max-new-tokens 64 \
   --temperature 0.8 \
@@ -172,8 +174,10 @@ python -m rfsn_v10_5.launcher generate \
 
 Notes:
 
+- `--checkpoint` accepts a single `.safetensors` or `.npz` file, a sharded `*.safetensors.index.json`, or a local model directory containing those files.
 - `--tokenizer` accepts a HuggingFace tokenizer ID or a local tokenizer path.
 - `--prompt-ids` remains available as the low-level escape hatch when you already have token IDs.
+- Some checkpoints need non-default architecture settings such as `--ffn-dim` or `--rope-base`; use the checkpoint's `config.json` values when they differ from the defaults.
 - If no tokenizer is supplied, `--prompt` still falls back to ASCII codepoints for demo/debug use only.
 - The `bench` subcommand uses random weights; only `generate` needs a checkpoint.
 
@@ -181,7 +185,7 @@ Notes:
 
 ```bash
 python -m rfsn_v10_5.launcher serve \
-  --checkpoint /path/to/model.safetensors \
+  --checkpoint /path/to/model-or-directory \
   --tokenizer /path/to/tokenizer-or-hf-id \
   --hidden-dim 4096 \
   --num-heads 32 \
@@ -189,6 +193,8 @@ python -m rfsn_v10_5.launcher serve \
   --head-dim 128 \
   --num-layers 32 \
   --vocab-size 32000 \
+  --ffn-dim 14336 \
+  --rope-base 500000 \
   --host 127.0.0.1 \
   --port 8000
 ```

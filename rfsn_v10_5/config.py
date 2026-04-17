@@ -27,8 +27,14 @@ Two enums are also defined:
   values are clipped and counted, allowing best-effort decoding.
 
 Pass 5 changes (retained)
---------------------------
+-------------------------
 - ``model_dtype``: configurable tensor dtype, default ``"bfloat16"``.
+
+Pass 7 changes
+--------------
+- ``ffn_dim``: optional explicit FFN hidden size. When set, this takes
+  precedence over ``hidden_dim * ffn_multiplier`` so checkpoints with
+  non-4x SwiGLU expansions can be loaded faithfully.
 
 Pass 6 changes
 --------------
@@ -136,6 +142,7 @@ class RFSNConfig:
     # Pass 4 additions
     rope_base: float = 10000.0
     ffn_multiplier: int = 4
+    ffn_dim: int = 0
     norm_eps: float = 1e-5
     rvq_max_active: int = 0  # 0 -> resolved to block_size_seq * num_heads
 
@@ -177,6 +184,9 @@ class RFSNConfig:
         # Resolve rvq_max_active default
         if self.rvq_max_active <= 0:
             self.rvq_max_active = self.block_size_seq * self.num_heads
+        # Resolve FFN size default
+        if self.ffn_dim <= 0:
+          self.ffn_dim = self.hidden_dim * self.ffn_multiplier
         # Resolve cache dtype default
         if not self.cache_dtype:
           self.cache_dtype = self.model_dtype

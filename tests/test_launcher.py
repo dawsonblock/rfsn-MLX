@@ -90,6 +90,35 @@ class LauncherTest(unittest.TestCase):
 
         self.assertEqual((config.num_subspaces, config.subspace_dim), (16, 8))
 
+    def test_build_config_accepts_explicit_ffn_dim_and_rope_base(self) -> None:
+        parser = launcher._make_parser()
+        args = parser.parse_args(
+            [
+                "bench",
+                "--hidden-dim",
+                "3072",
+                "--num-heads",
+                "24",
+                "--num-kv-heads",
+                "8",
+                "--head-dim",
+                "128",
+                "--num-layers",
+                "28",
+                "--vocab-size",
+                "128256",
+                "--ffn-dim",
+                "8192",
+                "--rope-base",
+                "500000",
+            ]
+        )
+
+        config = launcher._build_config(args)
+
+        self.assertEqual(config.ffn_dim, 8192)
+        self.assertEqual(config.rope_base, 500000.0)
+
     def test_check_command_uses_cache_dtype(self) -> None:
         parser = launcher._make_parser()
         args = parser.parse_args(["check", "--cache-dtype", "fp8_e4m3"])

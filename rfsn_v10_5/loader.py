@@ -69,6 +69,7 @@ Notes
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Dict, List, Union
@@ -143,6 +144,82 @@ def _load_file(path: Path) -> Dict[str, mx.array]:
     )
 
 
+def _resolve_checkpoint_index(index_path: Path) -> List[Path]:
+    """Resolve a Hugging Face sharded checkpoint index into shard paths."""
+    payload = json.loads(index_path.read_text())
+    weight_map = payload.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(
+            f"Checkpoint index '{index_path}' does not contain a non-empty weight_map"
+        )
+
+    shard_paths = sorted({index_path.parent / shard_name for shard_name in weight_map.values()})
+    missing = [str(path) for path in shard_paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Checkpoint index references missing shard files: "
+            f"{missing[:5]}{'...' if len(missing) > 5 else ''}"
+        )
+    return shard_paths
+
+
+def _resolve_checkpoint_paths(
+    paths: Union[str, Path, List[Union[str, Path]]],
+) -> List[Path]:
+    """Expand checkpoint inputs into concrete shard/file paths.
+
+    Accepted inputs:
+    - a single ``.safetensors`` or ``.npz`` file
+    - a ``*.safetensors.index.json`` file
+    - a directory containing either a sharded index or checkpoint files
+    - a list combining any of the above
+    """
+    raw_paths = [paths] if isinstance(paths, (str, Path)) else list(paths)
+    resolved: List[Path] = []
+    seen: set[Path] = set()
+
+    def _add(path: Path) -> None:
+        if path not in seen:
+            seen.add(path)
+            resolved.append(path)
+
+    for raw_path in raw_paths:
+        path = Path(raw_path)
+        if path.is_dir():
+            index_files = sorted(path.glob("*.safetensors.index.json"))
+            if index_files:
+                for shard_path in _resolve_checkpoint_index(index_files[0]):
+                    _add(shard_path)
+                continue
+
+            checkpoint_files = sorted(path.glob("*.safetensors")) + sorted(path.glob("*.npz"))
+            if checkpoint_files:
+                for checkpoint_path in checkpoint_files:
+                    _add(checkpoint_path)
+                continue
+
+            raise ValueError(
+                f"Checkpoint directory '{path}' does not contain .safetensors, .npz, "
+                "or a .safetensors.index.json file"
+            )
+
+        if path.name.endswith(".safetensors.index.json"):
+            for shard_path in _resolve_checkpoint_index(path):
+                _add(shard_path)
+            continue
+
+        if path.suffix.lower() in (".safetensors", ".npz"):
+            _add(path)
+            continue
+
+        raise ValueError(
+            f"Unsupported checkpoint input '{path}'. Expected a checkpoint file, "
+            "a sharded index file, or a directory containing them."
+        )
+
+    return resolved
+
+
 def load_hf_weights(
     model: RFSNMLX,
     paths: Union[str, Path, List[Union[str, Path]]],
@@ -167,8 +244,7 @@ def load_hf_weights(
     skipped : dict[str, str]
         Mapping of original HF key -> reason for skipping.
     """
-    if isinstance(paths, (str, Path)):
-        paths = [paths]
+    paths = _resolve_checkpoint_paths(paths)
 
     # Resolve target dtype from config
     dtype_map = {
@@ -181,7 +257,7 @@ def load_hf_weights(
     # Collect all weights from all shards
     all_weights: Dict[str, mx.array] = {}
     for p in paths:
-        shard = _load_file(Path(p))
+        shard = _load_file(p)
         all_weights.update(shard)
 
     # Remap keys and build the update dict
