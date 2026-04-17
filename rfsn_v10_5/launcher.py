@@ -27,10 +27,10 @@ Usage
     # Benchmark (no checkpoint needed; uses random weights)
     python -m rfsn_v10_5.launcher bench \\
         --hidden-dim 512 --num-heads 8 --head-dim 64 --num-layers 4 \\
-        --prompt-len 256 --decode-steps 100
+        --prompt-len 256 --decode-steps 100 --cache-dtype fp8_e4m3
 
     # Smoke test
-    python -m rfsn_v10_5.launcher check
+    python -m rfsn_v10_5.launcher check --cache-dtype fp8_e4m3
 
 Notes
 -----
@@ -74,6 +74,7 @@ def _build_config(args: argparse.Namespace) -> RFSNConfig:
         block_size_seq=getattr(args, "block_size_seq", 64),
         runtime_mode=RuntimeMode.COMPRESSED,
         model_dtype=getattr(args, "model_dtype", "bfloat16"),
+        cache_dtype=getattr(args, "cache_dtype", ""),
     )
 
 
@@ -123,7 +124,8 @@ def cmd_bench(args: argparse.Namespace) -> None:
     cache = RFSNCache(config, batch_size=1)
 
     print(f"[bench] Model: {config.num_layers}L x {config.hidden_dim}d, "
-          f"{config.num_heads}H/{config.num_kv_heads}KVH, dtype={config.model_dtype}")
+            f"{config.num_heads}H/{config.num_kv_heads}KVH, "
+            f"dtype={config.model_dtype}, cache_dtype={config.cache_dtype}")
 
     prefill_result = bench_prefill(
         model, cache,
@@ -148,10 +150,16 @@ def cmd_check(args: argparse.Namespace) -> None:
         hidden_dim=256, num_heads=4, head_dim=64, num_layers=2,
         vocab_size=1000, hot_capacity=64, warm_capacity=256,
         cold_capacity=1024, block_size_seq=16,
-        runtime_mode=RuntimeMode.COMPRESSED, model_dtype="float32",
+        runtime_mode=RuntimeMode.COMPRESSED,
+        model_dtype="float32",
+        cache_dtype=getattr(args, "cache_dtype", ""),
     )
     model = RFSNMLX(config)
     cache = RFSNCache(config, batch_size=1)
+
+    print(
+        f"[check] Config: dtype={config.model_dtype}, cache_dtype={config.cache_dtype}"
+    )
 
     prompt = mx.zeros((1, 8), dtype=mx.int32)
     out = model.prefill(prompt, cache)
@@ -193,6 +201,13 @@ def _make_parser() -> argparse.ArgumentParser:
         p.add_argument("--block-size-seq", type=int, default=64)
         p.add_argument("--model-dtype", type=str, default="bfloat16",
                        choices=["float16", "bfloat16", "float32"])
+        p.add_argument(
+            "--cache-dtype",
+            type=str,
+            default=None,
+            choices=["float16", "bfloat16", "float32", "fp8_e4m3"],
+            help="Cache storage dtype (defaults to model dtype)",
+        )
 
     # generate sub-command
     gen = sub.add_parser("generate", help="Generate text from a prompt")
@@ -221,6 +236,13 @@ def _make_parser() -> argparse.ArgumentParser:
 
     # check sub-command
     chk = sub.add_parser("check", help="Run a smoke test")
+    chk.add_argument(
+        "--cache-dtype",
+        type=str,
+        default=None,
+        choices=["float16", "bfloat16", "float32", "fp8_e4m3"],
+        help="Cache storage dtype for the smoke test (defaults to model dtype)",
+    )
     chk.set_defaults(func=cmd_check)
 
     return parser
