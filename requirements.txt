@@ -1,0 +1,6 @@
+mlx
+numpy
+safetensors
+transformers
+fastapi
+uvicorn

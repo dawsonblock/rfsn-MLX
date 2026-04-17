@@ -36,16 +36,16 @@ Notes
 -----
 - The launcher is intentionally minimal. For production use, integrate
   ``RFSNMLX`` directly into your application.
-- ``tokenizer`` support is not bundled. Pass pre-tokenised integer IDs
-  via ``--prompt-ids`` or implement your own tokeniser wrapper.
+- Tokenizer-backed text generation is optional. Pass ``--tokenizer`` to
+    encode ``--prompt`` and decode generated output, or use
+    ``--prompt-ids`` to provide raw token IDs directly.
 - MLX is Apple Silicon only; this module will raise ``ImportError`` on
-  non-Apple platforms unless MLX is installed.
+    non-Apple platforms unless MLX is installed.
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
 from typing import List, Optional
 
 import mlx.core as mx
@@ -53,6 +53,12 @@ import mlx.core as mx
 from .config import RFSNConfig, RuntimeMode
 from .cache import RFSNCache
 from .model import RFSNMLX
+from .tokenizer_utils import (
+    decode_token_ids,
+    encode_prompt_text,
+    load_tokenizer,
+    materialize_generated_sequence,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -94,9 +100,16 @@ def cmd_generate(args: argparse.Namespace) -> None:
             print(f"[loader] Skipped {len(skipped)} keys: {list(skipped.keys())[:5]}")
 
     cache = RFSNCache(config, batch_size=1)
+    tokenizer = load_tokenizer(args.tokenizer) if args.tokenizer else None
 
     if args.prompt_ids:
         prompt_ids = mx.array([list(map(int, args.prompt_ids.split(",")))], dtype=mx.int32)
+    elif tokenizer is not None:
+        prompt_ids = encode_prompt_text(
+            tokenizer,
+            args.prompt,
+            vocab_size=config.vocab_size,
+        )
     else:
         # Fallback: encode prompt as ASCII codepoints (demo only)
         ids = [min(ord(c), config.vocab_size - 1) for c in args.prompt]
@@ -107,23 +120,43 @@ def cmd_generate(args: argparse.Namespace) -> None:
         prompt_ids,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
+        cache=cache,
         top_p=args.top_p,
         top_k=args.top_k,
         repetition_penalty=args.repetition_penalty,
     )
-    if isinstance(generated, list):
-        if generated:
-            token_ids = mx.concatenate(
-                [prompt_ids] + [token[:, None] for token in generated],
-                axis=1,
-            )
-        else:
-            token_ids = prompt_ids
-    else:
-        token_ids = generated
+    token_ids = materialize_generated_sequence(prompt_ids, generated)
 
     print(f"[generate] Generated {token_ids.shape[1] - prompt_ids.shape[1]} new tokens")
     print(f"[generate] Output IDs: {token_ids[0].tolist()}")
+    if tokenizer is not None:
+        print(f"[generate] Output text: {decode_token_ids(tokenizer, token_ids)}")
+        if token_ids.shape[1] > prompt_ids.shape[1]:
+            print(
+                f"[generate] New text: "
+                f"{decode_token_ids(tokenizer, token_ids[:, prompt_ids.shape[1]:])}"
+            )
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    """Run the FastAPI inference wrapper."""
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise ImportError(
+            "Serving requires the 'uvicorn' package. Install it with "
+            "`python -m pip install uvicorn`."
+        ) from exc
+
+    from .api import create_app
+
+    config = _build_config(args)
+    app = create_app(
+        config,
+        checkpoint=args.checkpoint,
+        tokenizer_name_or_path=args.tokenizer,
+    )
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 def cmd_bench(args: argparse.Namespace) -> None:
@@ -226,9 +259,11 @@ def _make_parser() -> argparse.ArgumentParser:
     gen.add_argument("--checkpoint", type=str, default=None,
                      help="Path to .safetensors or .npz checkpoint")
     gen.add_argument("--prompt", type=str, default="Hello",
-                     help="Text prompt (ASCII codepoints used as token IDs)")
+                     help="Text prompt (tokenizer-backed when --tokenizer is set)")
     gen.add_argument("--prompt-ids", type=str, default=None,
                      help="Comma-separated integer token IDs (overrides --prompt)")
+    gen.add_argument("--tokenizer", type=str, default=None,
+                     help="HuggingFace tokenizer name or local path for text encode/decode")
     gen.add_argument("--max-new-tokens", type=int, default=50)
     gen.add_argument("--temperature", type=float, default=1.0)
     gen.add_argument("--top-p", type=float, default=1.0)
@@ -255,6 +290,17 @@ def _make_parser() -> argparse.ArgumentParser:
         help="Cache storage dtype for the smoke test (defaults to model dtype)",
     )
     chk.set_defaults(func=cmd_check)
+
+    # serve sub-command
+    srv = sub.add_parser("serve", help="Run the FastAPI inference wrapper")
+    _add_model_args(srv)
+    srv.add_argument("--checkpoint", type=str, default=None,
+                     help="Path to .safetensors or .npz checkpoint")
+    srv.add_argument("--tokenizer", type=str, default=None,
+                     help="HuggingFace tokenizer name or local path for text encode/decode")
+    srv.add_argument("--host", type=str, default="127.0.0.1")
+    srv.add_argument("--port", type=int, default=8000)
+    srv.set_defaults(func=cmd_serve)
 
     return parser
 

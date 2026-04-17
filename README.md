@@ -2,7 +2,7 @@
 
 An MLX-native transformer inference engine for Apple Silicon with tiered KV caching, compressed long-context archival, grouped-query attention, and an FP8 cache-storage path.
 
-> Status: inference backend and benchmark harness. The exact path, compressed archive path, packed FP8 cache mode, CLI smoke checks, and regression tests are implemented. Tokenizer integration, batching/service orchestration, and custom Metal kernels are intentionally left out of this repository.
+> Status: inference backend and benchmark harness. The exact path, compressed archive path, packed FP8 cache mode, tokenizer-backed CLI generation, cold-tier pruning, and a thin FastAPI wrapper are implemented. Continuous batching and custom Metal kernels remain future work.
 
 ## Highlights
 
@@ -64,7 +64,7 @@ This project is best thought of as an inference-systems playground with real eng
 - loading HuggingFace-style LLaMA/Mistral checkpoints
 - benchmarking prefill and decode behavior on Apple Silicon
 
-It is not currently a full serving stack. There is no bundled tokenizer, HTTP API, request batching layer, scheduler, or distributed runtime.
+It is not currently a full serving stack. A thin HTTP API and tokenizer-backed CLI are included, but there is still no request batching layer, scheduler, distributed runtime, or in-repo checkpoint-specific tokenizer assets.
 
 ## Requirements
 
@@ -72,6 +72,8 @@ It is not currently a full serving stack. There is no bundled tokenizer, HTTP AP
 - Python 3.10+
 - `mlx`
 - `numpy`
+- `transformers` for tokenizer-backed text generation
+- `fastapi` and `uvicorn` for the HTTP wrapper
 - optional: `safetensors` if you want to load external checkpoints outside MLX-native formats
 
 ## Install
@@ -80,10 +82,27 @@ It is not currently a full serving stack. There is no bundled tokenizer, HTTP AP
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install mlx numpy safetensors
 ```
 
-If you only need random-weight smoke checks and do not plan to load checkpoints, `safetensors` is optional.
+Minimal local runtime for smoke checks and benchmarks:
+
+```bash
+python -m pip install -r requirements-core.txt
+```
+
+Full local runtime for checkpoint loading, tokenizer-backed text I/O, and HTTP serving:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+If you only need random-weight smoke checks and do not plan to load checkpoints, `requirements-core.txt` is enough. If you only plan to drive the engine with `--prompt-ids`, tokenizer-backed text I/O remains optional.
+
+### Apple Silicon notes
+
+- MLX handles Apple Silicon acceleration automatically; there is no CUDA setup path in this repo.
+- This project targets the MLX runtime on Apple Silicon, not a guaranteed explicit Neural Engine execution path.
+- On an M1, M2, or M3 Mac, the recommended operator flow is `check` -> `bench` -> `generate` or `serve`.
 
 ## Quick start
 
@@ -136,13 +155,14 @@ Treat those numbers as sanity-check output, not a throughput claim for real mode
 ```bash
 python -m rfsn_v10_5.launcher generate \
   --checkpoint /path/to/model.safetensors \
+  --tokenizer /path/to/tokenizer-or-hf-id \
   --hidden-dim 4096 \
   --num-heads 32 \
   --num-kv-heads 8 \
   --head-dim 128 \
   --num-layers 32 \
   --vocab-size 32000 \
-  --prompt-ids 1,29871,518,29914 \
+  --prompt "Once upon a time" \
   --max-new-tokens 64 \
   --temperature 0.8 \
   --top-p 0.95 \
@@ -152,9 +172,89 @@ python -m rfsn_v10_5.launcher generate \
 
 Notes:
 
-- `--prompt` uses ASCII codepoints as a demo fallback, not a real tokenizer.
-- For real usage, prefer `--prompt-ids` from your own tokenizer pipeline.
+- `--tokenizer` accepts a HuggingFace tokenizer ID or a local tokenizer path.
+- `--prompt-ids` remains available as the low-level escape hatch when you already have token IDs.
+- If no tokenizer is supplied, `--prompt` still falls back to ASCII codepoints for demo/debug use only.
 - The `bench` subcommand uses random weights; only `generate` needs a checkpoint.
+
+### 4. Run the HTTP API
+
+```bash
+python -m rfsn_v10_5.launcher serve \
+  --checkpoint /path/to/model.safetensors \
+  --tokenizer /path/to/tokenizer-or-hf-id \
+  --hidden-dim 4096 \
+  --num-heads 32 \
+  --num-kv-heads 8 \
+  --head-dim 128 \
+  --num-layers 32 \
+  --vocab-size 32000 \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+Example requests:
+
+```bash
+curl -X POST http://127.0.0.1:8000/generate \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"Once upon a time","max_new_tokens":32}'
+
+curl -N -X POST http://127.0.0.1:8000/generate/stream \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"Once upon a time","max_new_tokens":8}'
+```
+
+### API schema
+
+`GET /health`
+
+Response body:
+
+```json
+{
+  "status": "ok",
+  "vocab_size": 32000,
+  "tokenizer_loaded": true
+}
+```
+
+`POST /generate`
+
+Request body:
+
+```json
+{
+  "prompt": "Once upon a time",
+  "prompt_ids": [1, 2, 3],
+  "max_new_tokens": 32,
+  "temperature": 0.8,
+  "top_p": 0.95,
+  "top_k": 50,
+  "repetition_penalty": 1.0
+}
+```
+
+Use either `prompt` or `prompt_ids`. Response body:
+
+```json
+{
+  "prompt_token_count": 4,
+  "generated_token_count": 32,
+  "token_ids": [1, 2, 3, 4, 5],
+  "text": "Once upon a time ...",
+  "generated_text": "..."
+}
+```
+
+`POST /generate/stream`
+
+The request body matches `/generate`. The route emits Server-Sent Events with:
+
+- `token`: `{"step": 1, "token_id": 7, "text": "hello"}`
+- `complete`: `{"token_ids": [...], "generated_token_count": 32, "text": "...", "generated_text": "..."}`
+
+The streaming route emits Server-Sent Events. It is still single-request-at-a-time inference and does not implement continuous batching.
 
 ## Python API
 
@@ -235,6 +335,28 @@ print(decode)
 
 Use `archive_seed_steps` in `bench_decode(...)` when you explicitly want the timed decode loop to run with archived context already present.
 
+### FastAPI wrapper
+
+```python
+from rfsn_v10_5 import RFSNConfig, RuntimeMode, create_app
+
+config = RFSNConfig(
+  hidden_dim=512,
+  num_heads=8,
+  num_kv_heads=8,
+  head_dim=64,
+  num_layers=4,
+  vocab_size=32000,
+  runtime_mode=RuntimeMode.COMPRESSED,
+)
+
+app = create_app(
+  config,
+  checkpoint="/path/to/model.safetensors",
+  tokenizer_name_or_path="/path/to/tokenizer-or-hf-id",
+)
+```
+
 ## Configuration guide
 
 ### Core architectural invariants
@@ -257,7 +379,7 @@ Use `archive_seed_steps` in `bench_decode(...)` when you explicitly want the tim
 | `num_kv_heads` | Enables grouped-query attention when smaller than `num_heads` |
 | `hot_capacity` | Max tokens kept device-resident per layer |
 | `warm_capacity` | Max archived tokens kept in RAM before spilling blocks onward |
-| `cold_capacity` | Upper bound tracked for disk-tier archival |
+| `cold_capacity` | Maximum retained archived tokens across disk-tier blocks; excess cold blocks are pruned |
 | `block_size_seq` | Eviction/compression granularity |
 | `rvq_max_active` | Fixed-width budget for archived RVQ residual entries |
 
@@ -275,6 +397,7 @@ The FP8 path is a cache-storage optimization, not a full-model FP8 execution pat
 ```text
 rfsn_v10_5/
   __init__.py
+  api.py
   attention_compressed.py
   attention_exact.py
   bench.py
@@ -286,17 +409,22 @@ rfsn_v10_5/
   layer.py
   loader.py
   model.py
+  tokenizer_utils.py
   types.py
 tests/
+  test_api.py
   test_cache_dtype.py
+  test_cold_tier_gc.py
   test_launcher.py
   test_performance.py
+  test_tokenizer_utils.py
 ```
 
 Module roles:
 
 - `config.py`: validated runtime and architecture config
 - `cache.py`: hot/warm/cold KV cache, eviction, archive reuse, FP8 storage plumbing
+- `api.py`: thin FastAPI wrapper with blocking and SSE-style generation endpoints
 - `codec.py`: PQ + RVQ encoding and decode helpers for archived keys
 - `attention_exact.py`: exact attention and segmented attention utilities
 - `attention_compressed.py`: mixed archived + hot attention path
@@ -311,30 +439,33 @@ Module roles:
 Run the focused regression suite:
 
 ```bash
-python -m unittest tests.test_launcher tests.test_cache_dtype tests.test_performance
+python -m unittest tests.test_api tests.test_launcher tests.test_tokenizer_utils tests.test_cold_tier_gc tests.test_cache_dtype tests.test_performance
 ```
 
 What these tests cover:
 
+- FastAPI health, blocking generate, and SSE stream routes
 - launcher config plumbing and smoke command behavior
 - packed FP8 hot-cache storage and round-trip correctness
 - archived warm/cold payload storage in compact `uint8` form
 - combined archived-context cache reuse across decode steps
+- cold-tier file deletion and retained-context pruning once `cold_capacity` is exceeded
 - archived decode performance smoke path, including capture-artifact fallback when the runtime lacks usable profiling hooks
 
 ## Current limitations
 
 - Apple Silicon only, because MLX is the execution backend.
-- No tokenizer is bundled.
+- No checkpoint-specific tokenizer assets or chat templates are bundled in-repo.
 - Compressed prefill for a single prompt chunk larger than `hot_capacity` is not implemented; large prompts should be chunked before prefill.
 - The profiling/capture smoke path falls back to a text artifact on runtimes where `mx.profiler` or Metal capture cannot start.
-- `cold_capacity` is enforced as a limit signal, but full cold-tier eviction policy is still a future design choice.
+- `cold_capacity` now prunes the least-recently-used retained cold archive, which means the oldest retained context may be truncated once the disk-tier budget is exceeded.
 - This repo focuses on inference; there is no training or fine-tuning pipeline.
+- The included FastAPI wrapper is single-request and does not solve continuous batching.
 
 ## Where to extend next
 
 - chunked prefill for very long prompts
-- a real tokenizer adapter and text decoding layer
+- checkpoint-aware tokenizer auto-discovery and chat templates
 - continuous batching / serving wrapper
 - richer profiling once runtime support is available
 - deeper kernel-level optimization if MLX graph-level improvements stop being enough

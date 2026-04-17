@@ -34,6 +34,9 @@ The implementation follows a strict separation of concerns:
 - `bench` contains utilities for benchmarking prefill and decode.
 - `launcher` contains a thin CLI for running tests, generating text
   and performing benchmarks.
+- `tokenizer_utils` keeps text encode/decode at the application
+  boundary while the model stays token-ID based.
+- `api` exposes a small FastAPI wrapper for single-request generation.
 
 Pass 5 additions (retained)
 ----------------------------
@@ -61,6 +64,7 @@ from .codec import HybridKeyCodec  # noqa: F401
 from .layer import RFSNLayerMLX, build_rope_tables  # noqa: F401
 from .model import RFSNMLX  # noqa: F401
 from .loader import load_hf_weights  # noqa: F401
+from .api import create_app  # noqa: F401
 
 __all__ = [
     "RFSNConfig",
@@ -73,4 +77,5 @@ __all__ = [
     "build_rope_tables",
     "RFSNMLX",
     "load_hf_weights",
+    "create_app",
 ]

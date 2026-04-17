@@ -64,6 +64,7 @@ Fix 2 - GQA-aware KV cache dimensions
 
 from __future__ import annotations
 
+import os
 import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple, Any
@@ -124,6 +125,8 @@ class LayerKVCache:
         # Warm and cold tiers
         self.warm_blocks: List[ArchivedKVBlock] = []
         self.cold_blocks: List[ArchivedKVBlock] = []
+        self._cold_access_tick: int = 0
+        self._cold_block_serial: int = 0
 
         self._archived_context_dirty: bool = True
         self._archived_k: Optional[mx.array] = None
@@ -176,6 +179,42 @@ class LayerKVCache:
         for block in self.warm_blocks + self.cold_blocks:
             block.reconstructed_k = None
             block.reconstructed_v = None
+
+    def _next_cold_access_tick(self) -> int:
+        self._cold_access_tick += 1
+        return self._cold_access_tick
+
+    def _touch_archived_blocks(self) -> None:
+        if not (self.cold_blocks or self.warm_blocks):
+            return
+        access_tick = self._next_cold_access_tick()
+        for block in self.cold_blocks + self.warm_blocks:
+            block.last_access_tick = access_tick
+
+    def _remove_cold_block_file(self, block: ArchivedKVBlock) -> None:
+        if not block.path:
+            return
+        try:
+            Path(block.path).unlink(missing_ok=True)
+        except TypeError:
+            if os.path.exists(block.path):
+                os.unlink(block.path)
+
+    def _prune_cold_tier(self) -> None:
+        cold_len = sum(b.end_pos - b.start_pos for b in self.cold_blocks)
+        pruned = False
+        while cold_len > self.config.cold_capacity and self.cold_blocks:
+            victim = min(
+                self.cold_blocks,
+                key=lambda block: (block.last_access_tick, block.start_pos),
+            )
+            self._remove_cold_block_file(victim)
+            self.cold_blocks.remove(victim)
+            cold_len = sum(b.end_pos - b.start_pos for b in self.cold_blocks)
+            pruned = True
+
+        if pruned:
+            self._mark_archived_context_dirty()
 
     @property
     def hot_write_index(self) -> int:
@@ -274,6 +313,7 @@ class LayerKVCache:
             loaded=True,
             reconstructed_k=None,
             reconstructed_v=None,
+            last_access_tick=0,
         )
         self.warm_blocks.append(warm_block)
         self.hot_head_index = (self.hot_head_index + prefix_len) % self.config.hot_capacity
@@ -388,7 +428,8 @@ class LayerKVCache:
             return
         if block.v_payload is None:
             return
-        block_id = len(self.cold_blocks)
+        block_id = self._cold_block_serial
+        self._cold_block_serial += 1
         path = self.cache_dir / f"layer_{id(self)}_block_{block_id}_{block.start_pos}.npz"
         np.savez_compressed(
             path,
@@ -417,17 +458,7 @@ class LayerKVCache:
             self._evict_warm_to_cold()
             warm_len = sum(b.end_pos - b.start_pos for b in self.warm_blocks)
 
-        # Pass 6: cold_capacity enforcement (warn; full drop is a future pass)
-        cold_len = sum(b.end_pos - b.start_pos for b in self.cold_blocks)
-        if cold_len > self.config.cold_capacity:
-            warnings.warn(
-                f"Cold tier length {cold_len} exceeds cold_capacity "
-                f"{self.config.cold_capacity}. "
-                "Oldest cold blocks should be dropped to enforce the limit. "
-                "Full cold eviction is not yet implemented.",
-                RuntimeWarning,
-                stacklevel=3,
-            )
+        self._prune_cold_tier()
 
     # ------------------------------------------------------------------
     # Materialisation helpers
@@ -452,6 +483,7 @@ class LayerKVCache:
             and self._archived_start is not None
             and self._archived_end is not None
         ):
+            self._touch_archived_blocks()
             return (
                 self._archived_k,
                 self._archived_v,
@@ -512,6 +544,7 @@ class LayerKVCache:
         self._archived_start = blocks[0][0]
         self._archived_end = self._archived_start + self._archived_k.shape[2]
         self._archived_context_dirty = False
+        self._touch_archived_blocks()
         self._clear_block_reconstruction_cache()
         return self._archived_k, self._archived_v, self._archived_start, self._archived_end
 

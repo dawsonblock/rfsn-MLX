@@ -121,6 +121,8 @@ class ArchivedKVBlock:
     # Pass 4: decoded-tensor cache (avoids re-decoding every token)
     reconstructed_k: Any | None = None
     reconstructed_v: Any | None = None
+    # Pass 8: cold-tier recency tracking for LRU pruning.
+    last_access_tick: int = 0
 
 
 @dataclass
