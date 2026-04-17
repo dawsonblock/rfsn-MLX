@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+import mlx.core as mx
+
+from rfsn_v10_5.bench import bench_decode
+from rfsn_v10_5.cache import RFSNCache
+from rfsn_v10_5.config import RFSNConfig, RuntimeMode
+from rfsn_v10_5.model import RFSNMLX
+
+
+class PerformanceSmokeTest(unittest.TestCase):
+    def _build_components(self) -> tuple[RFSNMLX, RFSNCache]:
+        config = RFSNConfig(
+            hidden_dim=64,
+            num_heads=4,
+            num_kv_heads=4,
+            head_dim=16,
+            num_layers=1,
+            vocab_size=128,
+            num_subspaces=4,
+            subspace_dim=4,
+            hot_capacity=8,
+            warm_capacity=16,
+            cold_capacity=32,
+            block_size_seq=4,
+            rvq_max_active=8,
+            runtime_mode=RuntimeMode.COMPRESSED,
+        )
+        model = RFSNMLX(config)
+        cache = RFSNCache(config, batch_size=1)
+        return model, cache
+
+    def _seed_archived_context(self, model: RFSNMLX, cache: RFSNCache) -> mx.array:
+        prompt = mx.zeros((1, 8), dtype=mx.int32)
+        logits = model.prefill(prompt, cache)
+        mx.eval(logits)
+
+        token = mx.zeros((1,), dtype=mx.int32)
+        for pos in range(8, 10):
+            logits = model.decode_step(token, cache, pos)
+            mx.eval(logits)
+            token = mx.argmax(logits, axis=-1).astype(mx.int32)
+
+        layer_cache = cache.layer(0)
+        self.assertTrue(layer_cache.warm_blocks or layer_cache.cold_blocks)
+        return token
+
+    def _start_capture(self, directory: Path) -> tuple[Path, callable]:
+        profiler = getattr(mx, "profiler", None)
+        if profiler is not None:
+            start = getattr(profiler, "start", None)
+            stop = getattr(profiler, "stop", None)
+            if callable(start) and callable(stop):
+                artifact = directory / "decode_step.profile"
+                try:
+                    start(str(artifact))
+                except RuntimeError as exc:
+                    self.skipTest(f"mx.profiler is unavailable in this runtime: {exc}")
+                return artifact, stop
+
+        metal = getattr(mx, "metal", None)
+        if metal is not None and hasattr(metal, "start_capture") and hasattr(metal, "stop_capture"):
+            artifact = directory / "decode_step.gputrace"
+            try:
+                metal.start_capture(str(artifact))
+            except RuntimeError as exc:
+                self.skipTest(f"Metal capture is unavailable in this runtime: {exc}")
+            return artifact, metal.stop_capture
+
+        self.skipTest("Neither mx.profiler nor mx.metal capture is available in this MLX build")
+
+    def _assert_capture_artifact(self, artifact_path: Path) -> None:
+        self.assertTrue(artifact_path.exists())
+        if artifact_path.is_dir():
+            self.assertTrue(any(artifact_path.iterdir()))
+        else:
+            self.assertGreater(artifact_path.stat().st_size, 0)
+
+    def test_archived_decode_capture_and_cache_reuse(self) -> None:
+        model, cache = self._build_components()
+        token = self._seed_archived_context(model, cache)
+        layer_cache = cache.layer(0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path, stop_capture = self._start_capture(Path(tmpdir))
+            try:
+                logits = model.decode_step(token, cache, 10)
+                mx.eval(logits)
+                archived_after_first = layer_cache._archived_k
+                self.assertIsNotNone(archived_after_first)
+
+                next_token = mx.argmax(logits, axis=-1).astype(mx.int32)
+                logits = model.decode_step(next_token, cache, 11)
+                mx.eval(logits)
+                archived_after_second = layer_cache._archived_k
+            finally:
+                stop_capture()
+
+            self.assertIs(archived_after_first, archived_after_second)
+            self._assert_capture_artifact(artifact_path)
+
+    def test_bench_decode_archive_seed_runs(self) -> None:
+        model, cache = self._build_components()
+        result = bench_decode(
+            model,
+            cache,
+            steps=4,
+            warmup=1,
+            repeats=1,
+            seed_prompt_len=8,
+            archive_seed_steps=2,
+        )
+        self.assertGreater(result.mean_ms, 0.0)
+        self.assertGreater(result.throughput, 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

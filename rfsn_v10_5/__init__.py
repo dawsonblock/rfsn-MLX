@@ -1,0 +1,76 @@
+"""Top-level package for the RFSN v10.5 implementation.
+
+This module exposes the primary user-facing classes and configuration
+objects. Consumers should import from here rather than reaching into
+internal modules whenever possible.
+
+The implementation follows a strict separation of concerns:
+
+- `config` defines the model configuration and validates invariants.
+- `types` holds simple dataclasses used to describe encoded and
+  archived key/value blocks.
+- `codec` implements product quantisation (PQ) and residual vector
+  quantisation (RVQ) on the key tensor. It exposes a `HybridKeyCodec`
+  which encodes keys into a compact representation and decodes them
+  back. The codec never participates in the hot-path attention logic
+  directly.
+- `cache` manages the per-layer key/value caches, including tiered
+  eviction into warm (RAM) and cold (disk) storage. The cache stores
+  exact tensors in the hot tier, and uses the codec to compress
+  evicted blocks.
+- `attention_exact` provides batched exact attention functions built
+  atop MLX's fast attention primitive. The exact path remains the
+  source of semantic truth.
+- `attention_compressed` reconstructs archived blocks and performs
+  attention over mixed contexts using the same semantics as the exact
+  path.
+- `layer` wires together projection, caching, attention and feed-forward
+  network logic for a single transformer layer. Exports
+  ``build_rope_tables`` for RoPE hoisting at the model level.
+- `model` defines the full transformer model and orchestrates the
+  per-layer caches during prefill and decode.
+- `loader` provides ``load_hf_weights`` for loading HuggingFace
+  LLaMA/Mistral checkpoints with automatic key remapping.
+- `bench` contains utilities for benchmarking prefill and decode.
+- `launcher` contains a thin CLI for running tests, generating text
+  and performing benchmarks.
+
+Pass 5 additions (retained)
+----------------------------
+- ``load_hf_weights``: HuggingFace safetensors/npz weight loader.
+- ``build_rope_tables``: exported for use in custom training loops.
+- ``RFSNConfig.model_dtype``: configurable tensor dtype (default bfloat16).
+
+Pass 6 additions
+----------------
+- ``RFSNConfig.num_kv_heads``: GQA support (default = num_heads for MHA).
+- ``bench``: prefill and decode benchmarking module (``bench_prefill``,
+  ``bench_decode``).
+- ``launcher``: CLI entry point (``python -m rfsn_v10_5.launcher``).
+- Evict-before-append in COMPRESSED mode (layer.py fix).
+- ``mlx.utils`` import fix in loader.py (``tree_flatten``/``tree_unflatten``).
+- ``cold_capacity`` enforcement in cache.py.
+
+Do not import internal modules directly; use the top-level symbols
+exposed here instead. See README.md for usage examples.
+"""
+
+from .config import RFSNConfig, RuntimeMode, SafetyMode  # noqa: F401
+from .cache import RFSNCache, LayerKVCache  # noqa: F401
+from .codec import HybridKeyCodec  # noqa: F401
+from .layer import RFSNLayerMLX, build_rope_tables  # noqa: F401
+from .model import RFSNMLX  # noqa: F401
+from .loader import load_hf_weights  # noqa: F401
+
+__all__ = [
+    "RFSNConfig",
+    "RuntimeMode",
+    "SafetyMode",
+    "RFSNCache",
+    "LayerKVCache",
+    "HybridKeyCodec",
+    "RFSNLayerMLX",
+    "build_rope_tables",
+    "RFSNMLX",
+    "load_hf_weights",
+]
