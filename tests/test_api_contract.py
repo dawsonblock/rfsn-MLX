@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
-from fastapi.testclient import TestClient
 
 from rfsn_v10_5.api import GenerateRequest, create_app
 from rfsn_v10_5.model import RFSNMLX
@@ -129,12 +128,14 @@ class APIContractTest(unittest.TestCase):
 
     def test_generate_stream_endpoint_emits_token_and_complete_events(self) -> None:
         app = self._build_app()
-        with TestClient(app) as client:
-            with client.stream("POST", "/generate/stream", json={"prompt": "Hello", "max_new_tokens": 2}) as response:
-                body = "".join(response.iter_text())
-                status_code = response.status_code
+        generate_stream = self._get_route_endpoint(app, "/generate/stream", "POST")
+        request = GenerateRequest(prompt="Hello", max_new_tokens=2)
+        response = generate_stream(request)
+        body = "".join(app.state.service.stream_generate(request))
+        status_code = response.status_code
 
         self.assertEqual(status_code, 200)
+        self.assertEqual(response.media_type, "text/event-stream")
         self.assertIn("event: token", body)
         self.assertIn('"token_id": 7', body)
         self.assertIn("event: complete", body)

@@ -79,8 +79,9 @@ def build_manifest(
 
 
 def build_payload(token_count: int, *, dtype: np.dtype = np.float32) -> dict[str, np.ndarray]:
-    keys = np.arange(token_count * 2, dtype=dtype).reshape(1, 1, token_count, 2)
-    values = (keys + dtype.type(100.0)).astype(dtype)
+    resolved_dtype = np.dtype(dtype)
+    keys = np.arange(token_count * 2, dtype=resolved_dtype).reshape(1, 1, token_count, 2)
+    values = (keys + resolved_dtype.type(100.0)).astype(resolved_dtype)
     return {"keys": keys, "values": values}
 
 
