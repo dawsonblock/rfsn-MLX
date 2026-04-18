@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 from fastapi import HTTPException
@@ -84,6 +85,7 @@ class APITest(unittest.TestCase):
 
         self.assertEqual(payload["status"], "ok")
         self.assertTrue(payload["tokenizer_loaded"])
+        self.assertEqual(payload["disk_cache_dir"], app.state.service.config.disk_cache_dir)
         self.assertEqual(payload["admission_control"]["max_concurrent_requests"], 1)
 
     def test_generate_endpoint_returns_token_ids_and_text(self) -> None:
@@ -106,6 +108,26 @@ class APITest(unittest.TestCase):
         )
 
         self.assertEqual(payload["token_ids"], [9, 10, 7, 8])
+
+    def test_generate_endpoint_restores_cache_when_requested(self) -> None:
+        app = self._build_app()
+        generate = self._get_route_endpoint(app, "/generate", "POST")
+        seen: dict[str, object] = {}
+
+        class FakeCache:
+            def __init__(self, config, batch_size: int) -> None:
+                seen["batch_size"] = batch_size
+
+            def restore_from_disk(self):
+                seen["restored"] = True
+                return [[]]
+
+        with patch("rfsn_v10_5.api.RFSNCache", FakeCache):
+            payload = generate(GenerateRequest(prompt="Hello", max_new_tokens=2, restore_cache=True))
+
+        self.assertTrue(seen["restored"])
+        self.assertEqual(seen["batch_size"], 1)
+        self.assertEqual(payload["token_ids"], [5, 6, 7, 8])
 
     def test_generate_stream_endpoint_emits_token_and_complete_events(self) -> None:
         app = self._build_app()

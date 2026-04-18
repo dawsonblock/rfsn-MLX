@@ -41,6 +41,14 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(config.cache_dtype, "fp8_e4m3")
         self.assertEqual((config.num_subspaces, config.subspace_dim), (4, 16))
 
+    def test_build_config_accepts_disk_cache_dir_override(self) -> None:
+        parser = launcher._make_parser()
+        args = parser.parse_args(["bench", "--disk-cache-dir", "/tmp/rfsn-cache"])
+
+        config = launcher._build_config(args)
+
+        self.assertEqual(config.disk_cache_dir, "/tmp/rfsn-cache")
+
     def test_build_config_auto_resolves_small_head_dim_subspaces(self) -> None:
         parser = launcher._make_parser()
         args = parser.parse_args(
@@ -240,6 +248,59 @@ class LauncherTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "vocab_size=16"):
                 launcher.cmd_generate(args)
 
+    def test_generate_command_restores_persisted_cache_when_requested(self) -> None:
+        parser = launcher._make_parser()
+        args = parser.parse_args(
+            [
+                "generate",
+                "--prompt-ids",
+                "1,2",
+                "--restore-cache",
+                "--disk-cache-dir",
+                "/tmp/rfsn-cache",
+                "--max-new-tokens",
+                "2",
+            ]
+        )
+        seen: dict[str, object] = {}
+
+        class FakeCache:
+            def __init__(self, config, batch_size: int) -> None:
+                seen["disk_cache_dir"] = config.disk_cache_dir
+                self.config = config
+                self.batch_size = batch_size
+
+            def restore_from_disk(self):
+                seen["restored"] = True
+                return [[object(), object()]]
+
+        class FakeModel:
+            def __init__(self, config) -> None:
+                self.config = config
+
+            def generate(
+                self,
+                prompt_ids,
+                max_new_tokens: int,
+                cache=None,
+                temperature: float = 1.0,
+                top_p: float = 1.0,
+                top_k: int = 0,
+                repetition_penalty: float = 1.0,
+            ):
+                return [mx.array([3], dtype=mx.int32), mx.array([4], dtype=mx.int32)]
+
+        output = io.StringIO()
+        with patch("rfsn_v10_5.launcher.RFSNMLX", FakeModel), patch(
+            "rfsn_v10_5.launcher.RFSNCache", FakeCache
+        ), redirect_stdout(output):
+            launcher.cmd_generate(args)
+
+        stdout = output.getvalue()
+        self.assertTrue(seen["restored"])
+        self.assertEqual(seen["disk_cache_dir"], "/tmp/rfsn-cache")
+        self.assertIn("Restored 2 persisted blocks", stdout)
+
     def test_generate_command_uses_tokenizer_for_text_io(self) -> None:
         parser = launcher._make_parser()
         args = parser.parse_args(
@@ -381,6 +442,8 @@ class LauncherTest(unittest.TestCase):
                 "weights.safetensors",
                 "--tokenizer",
                 "demo-tokenizer",
+                "--disk-cache-dir",
+                "/tmp/rfsn-cache",
                 "--max-concurrent-requests",
                 "2",
                 "--max-queue-size",
@@ -406,6 +469,7 @@ class LauncherTest(unittest.TestCase):
             seen["checkpoint"] = checkpoint
             seen["tokenizer"] = tokenizer_name_or_path
             seen["vocab_size"] = config.vocab_size
+            seen["disk_cache_dir"] = config.disk_cache_dir
             seen["max_concurrent_requests"] = max_concurrent_requests
             seen["max_queue_size"] = max_queue_size
             return object()
@@ -422,6 +486,7 @@ class LauncherTest(unittest.TestCase):
 
         self.assertEqual(seen["checkpoint"], "weights.safetensors")
         self.assertEqual(seen["tokenizer"], "demo-tokenizer")
+        self.assertEqual(seen["disk_cache_dir"], "/tmp/rfsn-cache")
         self.assertEqual(seen["max_concurrent_requests"], 2)
         self.assertEqual(seen["max_queue_size"], 4)
         self.assertEqual(seen["host"], "0.0.0.0")

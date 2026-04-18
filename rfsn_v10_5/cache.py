@@ -432,9 +432,6 @@ class LayerKVCache:
         stats["residency_metrics"] = self.residency_manager.get_metrics()
         return stats
 
-    def invalidate_reconstructed_cache(self) -> None:
-        """Compatibility no-op retained for benchmark reset callers."""
-
 
 class RFSNCache:
     """Wrapper for per-layer exact caches."""

@@ -30,6 +30,7 @@ class GenerateRequest(BaseModel):
     prompt: Optional[str] = None
     messages: Optional[list[dict[str, Any]]] = None
     prompt_ids: Optional[list[int]] = None
+    restore_cache: bool = False
     max_new_tokens: int = Field(default=50, ge=1)
     temperature: float = Field(default=1.0, ge=0.0)
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
@@ -120,6 +121,12 @@ class RFSNAPIService:
             max_queue_size=max_queue_size,
         )
 
+    def _build_cache(self, batch_size: int, *, restore_cache: bool = False) -> RFSNCache:
+        cache = RFSNCache(self.config, batch_size=batch_size)
+        if restore_cache:
+            cache.restore_from_disk()
+        return cache
+
     def _prepare_prompt_ids(self, request: GenerateRequest) -> mx.array:
         if request.prompt_ids is not None:
             return prompt_ids_from_list(request.prompt_ids, vocab_size=self.config.vocab_size)
@@ -147,7 +154,10 @@ class RFSNAPIService:
         prompt_ids: mx.array,
         request: GenerateRequest,
     ) -> dict[str, Any]:
-        cache = RFSNCache(self.config, batch_size=prompt_ids.shape[0])
+        cache = self._build_cache(
+            prompt_ids.shape[0],
+            restore_cache=request.restore_cache,
+        )
         token_ids = materialize_generated_sequence(
             prompt_ids,
             self.model.generate(
@@ -188,7 +198,10 @@ class RFSNAPIService:
     ) -> Iterator[mx.array]:
 
         def _token_iterator() -> Iterator[mx.array]:
-            cache = RFSNCache(self.config, batch_size=prompt_ids.shape[0])
+            cache = self._build_cache(
+                prompt_ids.shape[0],
+                restore_cache=request.restore_cache,
+            )
             seen_ids = prompt_ids
             logits = self.model.prefill(prompt_ids, cache)
             mx.eval(logits)
@@ -278,6 +291,7 @@ def create_app(
             "status": "ok",
             "vocab_size": service.config.vocab_size,
             "max_position_embeddings": service.config.max_position_embeddings,
+            "disk_cache_dir": service.config.disk_cache_dir,
             "tokenizer_loaded": service.tokenizer is not None,
             "admission_control": service.admission.snapshot(),
         }

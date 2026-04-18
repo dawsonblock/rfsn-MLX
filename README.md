@@ -1,19 +1,19 @@
 # rfsn-MLX
 
-An MLX-native transformer inference engine for Apple Silicon with tiered KV caching, compressed long-context archival, grouped-query attention, and an FP8 cache-storage path.
+An MLX-native transformer inference engine for Apple Silicon with exact retained-context semantics, disk-backed KV paging, corruption-safe block storage, grouped-query attention, and tokenizer-backed CLI/API surfaces.
 
-> Status: inference backend and benchmark harness. The exact path, compressed archive path, packed FP8 cache mode, tokenizer-backed CLI generation, cold-tier pruning, and a thin FastAPI wrapper are implemented. Continuous batching and custom Metal kernels remain future work.
+> Status: the V11 exact block-managed runtime is implemented. Long-context spill/reload, restart restoration, chunked prefill, HF config auto-loading, chat-template message input, and a thin single-request FastAPI wrapper are in place. Continuous batching, explicit session management, and custom Metal kernels remain future work.
 
 ## Highlights
 
 | Area | What is implemented | Why it matters |
 | --- | --- | --- |
-| Exact attention | MLX-based exact attention is the semantic reference path | Keeps correctness anchored while optimizations evolve |
-| Long-context archive | Hot KV overflow is evicted into warm RAM and cold disk tiers | Lets decode continue beyond device-resident context limits |
-| Compression | PQ + RVQ are used to compact archived keys | Reduces archive footprint while keeping reconstruction vectorized |
-| FP8 cache mode | `cache_dtype=fp8_e4m3` stores hot and archived values in 1-byte form | Cuts cache memory pressure on runtimes without native float8 |
+| Exact segmented attention | The active runtime path uses exact attention over archived segments plus the hot window | Preserves retained-context semantics without lossy reconstruction on the hot path |
+| Block-managed archive | Hot KV overflow is sealed into exact archived blocks tracked by a page table | Makes long-context residency explicit and inspectable |
+| Corruption-safe persistence | Archived blocks are stored as `.npz` payloads plus checksummed manifests | Missing or corrupt cold blocks do not take down the runtime |
+| Restart restoration | Persisted blocks can be rebuilt into a fresh cache when config/model identity match | Lets long-context work survive process restarts |
 | GQA support | `num_kv_heads` can be smaller than `num_heads` | Matches modern LLM attention layouts |
-| Decode-path optimization | Mixed-context attention operates on cached segments instead of rebuilding full context each step | Removes a major per-token reconstruction cost |
+| Decode-path optimization | Attention consumes cached segments directly instead of rebuilding a monolithic archive tensor every token | Removes a major per-token reconstruction cost |
 | Benchmarking | Built-in smoke checks plus prefill/decode timing helpers | Makes regressions easy to catch locally |
 
 ## Architecture
@@ -38,11 +38,11 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    H[Hot tier on device\nring buffer] -->|oldest prefix evicted| W[Warm tier in RAM\nencoded keys + compact V payload]
-    W -->|spill when warm grows| C[Cold tier on disk\nserialized blocks]
-    W --> M[Combined archived context cache]
-    C --> M
-    M --> A[Segmented mixed attention]
+  H[Hot tier on device\nexact ring buffer] -->|sealed prefix| W[Warm tier in RAM\nexact archived blocks]
+  W -->|spill when warm grows| C[Cold tier on disk\nchecksummed payloads + manifests]
+  W --> P[Page table + residency manager]
+  C --> P
+  P --> A[Exact segmented attention]
     H --> A
 ```
 
@@ -50,21 +50,22 @@ flowchart LR
 
 - RoPE tables are hoisted once per forward call and reused across layers.
 - The hot tier is a preallocated ring buffer, so append is constant-time and avoids compaction copies.
-- Archived RVQ metadata is stored in fixed-width tensors instead of Python-managed sparse objects.
-- Decode uses archived and hot attention segments directly instead of rebuilding one monolithic context tensor every token.
-- Archived context reuse is cached at the combined archive level, avoiding duplicate per-block reconstructed tensors staying resident.
+- Archived context is tracked by manifests and a page table rather than a monolithic reconstructed archive tensor.
+- Cold blocks are loaded lazily, and decode can prefetch adjacent blocks when it detects sequential access.
+- Persisted cache state can be restored into a fresh cache when the model identity and config match.
 
 ## What the repository is for
 
 This project is best thought of as an inference-systems playground with real engineering constraints:
 
 - exact short-context inference
-- compressed long-context inference once hot capacity is exceeded
+- exact long-context inference once hot capacity is exceeded
+- disk-backed KV persistence with corruption handling and restart restoration
 - experimentation with cache storage dtypes separate from model dtypes
 - loading HuggingFace-style LLaMA/Mistral checkpoints
 - benchmarking prefill and decode behavior on Apple Silicon
 
-It is not currently a full serving stack. A thin HTTP API and tokenizer-backed CLI are included, but there is still no request batching layer, scheduler, distributed runtime, or in-repo checkpoint-specific tokenizer assets.
+It is not currently a full serving stack. A thin HTTP API and tokenizer-backed CLI are included, but there is still no request batching layer, scheduler, distributed runtime, or explicit multi-session cache manager. The repo still contains older codec-related modules for experimentation, but the V11 runtime path is the exact block-managed archive.
 
 ## Requirements
 
@@ -176,9 +177,13 @@ Notes:
 
 - `--checkpoint` accepts a single `.safetensors` or `.npz` file, a sharded `*.safetensors.index.json`, or a local model directory containing those files.
 - `--tokenizer` accepts a HuggingFace tokenizer ID or a local tokenizer path.
+- If a checkpoint path contains a supported `config.json`, launcher config is auto-loaded unless `--no-hf-config` is set.
+- `--messages-json` accepts a JSON array of chat messages and formats it through the tokenizer template.
 - `--prompt-ids` remains available as the low-level escape hatch when you already have token IDs.
+- `--disk-cache-dir` controls where archived KV blocks are persisted.
+- `--restore-cache` restores persisted KV blocks from `--disk-cache-dir` before generation; use it only when the supplied input is continuation context, not a replayed full prompt.
 - Some checkpoints need non-default architecture settings such as `--ffn-dim` or `--rope-base`; use the checkpoint's `config.json` values when they differ from the defaults.
-- If no tokenizer is supplied, `--prompt` still falls back to ASCII codepoints for demo/debug use only.
+- Text prompts require `--tokenizer`; otherwise use `--prompt-ids` directly.
 - The `bench` subcommand uses random weights; only `generate` needs a checkpoint.
 
 ### 4. Run the HTTP API
@@ -221,7 +226,15 @@ Response body:
 {
   "status": "ok",
   "vocab_size": 32000,
-  "tokenizer_loaded": true
+  "max_position_embeddings": 131072,
+  "disk_cache_dir": "./rfsn_disk_cache",
+  "tokenizer_loaded": true,
+  "admission_control": {
+    "max_concurrent_requests": 1,
+    "max_queue_size": 0,
+    "active_requests": 0,
+    "queued_requests": 0
+  }
 }
 ```
 
@@ -232,7 +245,9 @@ Request body:
 ```json
 {
   "prompt": "Once upon a time",
+  "messages": [{"role": "user", "content": "Once upon a time"}],
   "prompt_ids": [1, 2, 3],
+  "restore_cache": false,
   "max_new_tokens": 32,
   "temperature": 0.8,
   "top_p": 0.95,
@@ -252,6 +267,8 @@ Use either `prompt` or `prompt_ids`. Response body:
   "generated_text": "..."
 }
 ```
+
+Use one of `prompt`, `messages`, or `prompt_ids`. Set `restore_cache` only when the supplied input should be appended to persisted context already stored in `disk_cache_dir`.
 
 `POST /generate/stream`
 
@@ -363,6 +380,8 @@ app = create_app(
 )
 ```
 
+Send `restore_cache: true` in a `/generate` or `/generate/stream` request when you want the request cache to rebuild any persisted blocks before processing the supplied continuation input.
+
 ## Configuration guide
 
 ### Core architectural invariants
@@ -379,14 +398,15 @@ app = create_app(
 
 | Field | Meaning |
 | --- | --- |
-| `runtime_mode` | `exact` keeps only the hot cache; `compressed` archives overflow and reuses it during decode |
+| `runtime_mode` | Compatibility enum retained on `RFSNConfig`; the active V11 runtime always executes exact segmented attention over block-managed archived context |
 | `model_dtype` | Weight and activation dtype for the model path |
-| `cache_dtype` | Storage dtype for KV cache; defaults to `model_dtype`; accepts `fp8_e4m3` |
+| `cache_dtype` | Compatibility/storage knob retained on the config and CLI; the active exact archive path persists exact payloads using the model/runtime dtype |
 | `num_kv_heads` | Enables grouped-query attention when smaller than `num_heads` |
 | `hot_capacity` | Max tokens kept device-resident per layer |
 | `warm_capacity` | Max archived tokens kept in RAM before spilling blocks onward |
 | `cold_capacity` | Maximum retained archived tokens across disk-tier blocks; excess cold blocks are pruned |
 | `block_size_seq` | Eviction/compression granularity |
+| `disk_cache_dir` | Root directory for persisted archived KV blocks and their manifests |
 | `rvq_max_active` | Fixed-width budget for archived RVQ residual entries |
 
 ### Choosing cache dtypes
@@ -407,14 +427,18 @@ rfsn_v10_5/
   attention_compressed.py
   attention_exact.py
   bench.py
+  block_manager.py
   cache.py
   codec.py
   config.py
   fp8.py
+  hf_config.py
   launcher.py
   layer.py
   loader.py
   model.py
+  residency.py
+  storage.py
   tokenizer_utils.py
   types.py
 tests/

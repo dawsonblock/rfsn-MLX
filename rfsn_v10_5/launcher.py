@@ -40,6 +40,7 @@ _MODEL_ARG_DEFAULTS = {
     "block_size_seq": 64,
     "model_dtype": "bfloat16",
     "cache_dtype": None,
+    "disk_cache_dir": "./rfsn_disk_cache",
 }
 
 
@@ -96,6 +97,7 @@ def _build_manual_config(args: argparse.Namespace) -> RFSNConfig:
         runtime_mode=RuntimeMode.COMPRESSED,
         model_dtype=getattr(args, "model_dtype", "bfloat16"),
         cache_dtype=getattr(args, "cache_dtype", "") or "",
+        disk_cache_dir=getattr(args, "disk_cache_dir", "./rfsn_disk_cache"),
     )
 
 
@@ -146,6 +148,13 @@ def _load_messages_json(path: str) -> list[dict[str, Any]]:
     return payload
 
 
+def _restore_cache_if_requested(cache: RFSNCache, *, enabled: bool) -> int:
+    if not enabled:
+        return 0
+    restored = cache.restore_from_disk()
+    return sum(len(layer_manifests) for layer_manifests in restored)
+
+
 def _aggregate_block_stats(cache: Any) -> dict[str, int]:
     if not hasattr(cache, "layers"):
         return {
@@ -185,7 +194,14 @@ def cmd_generate(args: argparse.Namespace) -> None:
             print(f"[loader] Skipped {len(skipped)} keys: {list(skipped.keys())[:5]}")
 
     cache = RFSNCache(config, batch_size=1)
+    restored_block_count = _restore_cache_if_requested(cache, enabled=args.restore_cache)
     tokenizer = load_tokenizer(args.tokenizer) if args.tokenizer else None
+
+    if args.restore_cache:
+        print(
+            f"[generate] Restored {restored_block_count} persisted blocks from {config.disk_cache_dir}; "
+            "provided input will be appended as continuation context"
+        )
 
     if args.prompt_ids:
         prompt_ids = prompt_ids_from_list(
@@ -307,6 +323,7 @@ def cmd_check(args: argparse.Namespace) -> None:
         runtime_mode=RuntimeMode.COMPRESSED,
         model_dtype="float32",
         cache_dtype=getattr(args, "cache_dtype", "") or "",
+        disk_cache_dir=getattr(args, "disk_cache_dir", "./rfsn_disk_cache"),
     )
     model = RFSNMLX(config)
     cache = RFSNCache(config, batch_size=1)
@@ -360,6 +377,7 @@ def _make_parser() -> argparse.ArgumentParser:
         p.add_argument("--warm-capacity", type=int, default=2048)
         p.add_argument("--cold-capacity", type=int, default=8192)
         p.add_argument("--block-size-seq", type=int, default=64)
+        p.add_argument("--disk-cache-dir", type=str, default="./rfsn_disk_cache")
         p.add_argument("--model-dtype", type=str, default="bfloat16",
                        choices=["float16", "bfloat16", "float32"])
         p.add_argument(
@@ -382,6 +400,8 @@ def _make_parser() -> argparse.ArgumentParser:
                      help="Comma-separated integer token IDs (overrides text and messages)")
     gen.add_argument("--tokenizer", type=str, default=None,
                      help="HuggingFace tokenizer name or local path for text encode/decode")
+    gen.add_argument("--restore-cache", action="store_true",
+                     help="Restore persisted KV blocks from --disk-cache-dir before appending the provided prompt")
     gen.add_argument("--no-hf-config", action="store_true",
                      help="Disable automatic config.json loading from the checkpoint path")
     gen.add_argument("--max-new-tokens", type=int, default=50)
@@ -409,6 +429,7 @@ def _make_parser() -> argparse.ArgumentParser:
         choices=["float16", "bfloat16", "float32", "fp8_e4m3"],
         help="Legacy cache storage dtype for the smoke test",
     )
+    chk.add_argument("--disk-cache-dir", type=str, default="./rfsn_disk_cache")
     chk.set_defaults(func=cmd_check)
 
     srv = sub.add_parser("serve", help="Run the FastAPI inference wrapper")

@@ -7,23 +7,17 @@ internal modules whenever possible.
 The implementation follows a strict separation of concerns:
 
 - `config` defines the model configuration and validates invariants.
-- `types` holds simple dataclasses used to describe encoded and
-  archived key/value blocks.
-- `codec` implements product quantisation (PQ) and residual vector
-  quantisation (RVQ) on the key tensor. It exposes a `HybridKeyCodec`
-  which encodes keys into a compact representation and decodes them
-  back. The codec never participates in the hot-path attention logic
-  directly.
-- `cache` manages the per-layer key/value caches, including tiered
-  eviction into warm (RAM) and cold (disk) storage. The cache stores
-  exact tensors in the hot tier, and uses the codec to compress
-  evicted blocks.
+- `cache` manages the per-layer exact KV caches, including block-managed
+  archival into warm RAM and cold disk tiers.
+- `block_manager` defines the V11 page-table metadata and residency
+  authority for archived exact KV blocks.
+- `storage` provides corruption-safe disk persistence for block payloads
+  and manifest rebuild on restart.
+- `residency` adds the explicit warm-set and look-ahead prefetch policy
+  used by the exact block-managed cache.
 - `attention_exact` provides batched exact attention functions built
-  atop MLX's fast attention primitive. The exact path remains the
-  source of semantic truth.
-- `attention_compressed` reconstructs archived blocks and performs
-  attention over mixed contexts using the same semantics as the exact
-  path.
+  atop MLX's fast attention primitive. The V11 runtime always uses this
+  exact segmented-attention path.
 - `layer` wires together projection, caching, attention and feed-forward
   network logic for a single transformer layer. Exports
   ``build_rope_tables`` for RoPE hoisting at the model level.
@@ -31,20 +25,17 @@ The implementation follows a strict separation of concerns:
   per-layer caches during prefill and decode.
 - `loader` provides ``load_hf_weights`` for loading HuggingFace
   LLaMA/Mistral checkpoints with automatic key remapping.
-- `bench` contains utilities for benchmarking prefill and decode.
-- `launcher` contains a thin CLI for running tests, generating text
-  and performing benchmarks.
-- `tokenizer_utils` keeps text encode/decode at the application
-  boundary while the model stays token-ID based.
-- `api` exposes a small FastAPI wrapper for single-request generation.
-- `block_manager` defines the Phase 0 V11 page-table metadata and
-  residency authority for archived exact KV blocks.
-- `storage` provides corruption-safe disk persistence for block payloads
-  and manifest rebuild on restart.
-- `residency` adds the explicit warm-set and look-ahead prefetch policy
-  used by the exact block-managed cache.
 - `hf_config` maps supported Hugging Face config.json files into
   `RFSNConfig` without putting config parsing in the runtime hot path.
+- `tokenizer_utils` keeps text and message formatting at the application
+  boundary while the model stays token-ID based.
+- `launcher` contains the CLI for generation, benchmarks, smoke checks,
+  and cache-persistence controls.
+- `api` exposes the single-request FastAPI wrapper with admission
+  control and per-request cache restoration.
+- `codec`, `types`, and `attention_compressed` remain in-repo for older
+  experiments and compatibility, but they are not the active V11 long-
+  context runtime path.
 
 Pass 5 additions (retained)
 ----------------------------
