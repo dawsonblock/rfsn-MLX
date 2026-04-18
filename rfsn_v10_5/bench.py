@@ -123,11 +123,7 @@ def bench_prefill(
 
     def _run() -> None:
         # Reset cache state between iterations
-        for layer_cache in cache.layers:
-            layer_cache.hot_seq_len = 0
-            layer_cache.hot_start = 0
-            layer_cache.warm_blocks.clear()
-            layer_cache.cold_blocks.clear()
+        cache.reset(clear_persisted=True)
         out = model.prefill(prompt_ids, cache)
         mx.eval(out)
 
@@ -194,13 +190,7 @@ def bench_decode(
 
     def _seed_cache() -> int:
         """Reset cache and run prefill; return next position."""
-        for layer_cache in cache.layers:
-            layer_cache.hot_seq_len = 0
-            layer_cache.hot_start = 0
-            layer_cache.hot_head_index = 0
-            layer_cache.warm_blocks.clear()
-            layer_cache.cold_blocks.clear()
-            layer_cache.invalidate_reconstructed_cache()
+        cache.reset(clear_persisted=True)
         model.prefill(seed_ids, cache)
         pos = seed_prompt_len
         if archive_seed_steps > 0:

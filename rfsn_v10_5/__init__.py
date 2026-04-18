@@ -37,6 +37,10 @@ The implementation follows a strict separation of concerns:
 - `tokenizer_utils` keeps text encode/decode at the application
   boundary while the model stays token-ID based.
 - `api` exposes a small FastAPI wrapper for single-request generation.
+- `block_manager` defines the Phase 0 V11 page-table metadata and
+  residency authority for archived exact KV blocks.
+- `storage` provides corruption-safe disk persistence for block payloads
+  and manifest rebuild on restart.
 
 Pass 5 additions (retained)
 ----------------------------
@@ -65,6 +69,15 @@ from .layer import RFSNLayerMLX, build_rope_tables  # noqa: F401
 from .model import RFSNMLX  # noqa: F401
 from .loader import load_hf_weights  # noqa: F401
 from .api import create_app  # noqa: F401
+from .block_manager import (  # noqa: F401
+  BlockId,
+  BlockLocation,
+  BlockManager,
+  BlockManifest,
+  BlockSpan,
+  PageTable,
+)
+from .storage import BlockStorage  # noqa: F401
 
 __all__ = [
     "RFSNConfig",
@@ -78,4 +91,11 @@ __all__ = [
     "RFSNMLX",
     "load_hf_weights",
     "create_app",
+    "BlockId",
+    "BlockLocation",
+    "BlockManager",
+    "BlockManifest",
+    "BlockSpan",
+    "PageTable",
+    "BlockStorage",
 ]

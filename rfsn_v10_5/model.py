@@ -36,7 +36,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .cache import RFSNCache
-from .codec import HybridKeyCodec
 from .config import RFSNConfig
 from .layer import RFSNLayerMLX, build_rope_tables
 
@@ -52,9 +51,6 @@ class RFSNMLX(nn.Module):
     def __init__(self, config: RFSNConfig) -> None:
         super().__init__()
         self.config = config
-
-        # Shared codec (one set of codebooks for all layers)
-        self.codec = HybridKeyCodec(config)
 
         # Token embedding
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_dim)
@@ -115,10 +111,22 @@ class RFSNMLX(nn.Module):
         -------
         logits : mx.array, shape (B, L, vocab_size)
         """
-        B, L = tokens.shape
-        start_pos = cache.layer(0).hot_start + cache.layer(0).hot_seq_len
-        x = self.embed_tokens(tokens)
-        return self._forward(x, cache, start_pos)
+        _, seq_len = tokens.shape
+        if seq_len == 0:
+            raise ValueError("prefill requires at least one token")
+
+        chunk_size = max(1, min(self.config.hot_capacity, seq_len))
+        logits_chunks: List[mx.array] = []
+        chunk_start = 0
+        while chunk_start < seq_len:
+            chunk_end = min(seq_len, chunk_start + chunk_size)
+            token_chunk = tokens[:, chunk_start:chunk_end]
+            start_pos = cache.layer(0).hot_end
+            x = self.embed_tokens(token_chunk)
+            logits_chunks.append(self._forward(x, cache, start_pos))
+            chunk_start = chunk_end
+
+        return logits_chunks[0] if len(logits_chunks) == 1 else mx.concatenate(logits_chunks, axis=1)
 
     def decode_step(
         self,
