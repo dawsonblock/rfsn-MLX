@@ -1,13 +1,14 @@
-"""Tokenizer helpers for text-in/text-out generation.
+"""Tokenizer helpers for text and message formatting.
 
 The core model remains token-ID based. This module keeps tokenizer
-loading, text encoding, and ID decoding at the application boundary so
-the inference engine does not depend on a specific tokenizer runtime.
+loading, chat-template formatting, text encoding, and ID decoding at
+the application boundary so the inference engine does not depend on a
+specific tokenizer runtime.
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterable, List
+from typing import Any, Iterable, List, Mapping, Sequence
 
 import mlx.core as mx
 
@@ -29,6 +30,19 @@ def load_tokenizer(name_or_path: str) -> Any:
         if eos_token is not None:
             tokenizer.pad_token = eos_token
     return tokenizer
+
+
+def tokenizer_supports_chat_templates(tokenizer: Any) -> bool:
+    """Return whether the tokenizer exposes ``apply_chat_template``."""
+    return callable(getattr(tokenizer, "apply_chat_template", None))
+
+
+def get_tokenizer_capabilities(tokenizer: Any) -> dict[str, bool]:
+    """Describe the small capability set used by the application layer."""
+    return {
+        "chat_template": tokenizer_supports_chat_templates(tokenizer),
+        "decode": callable(getattr(tokenizer, "decode", None)),
+    }
 
 
 def _normalize_token_ids(token_ids: Any) -> List[int]:
@@ -91,6 +105,54 @@ def encode_prompt_text(
     return prompt_ids_from_list(_normalize_token_ids(encoded), vocab_size=vocab_size)
 
 
+def apply_chat_template(
+    tokenizer: Any,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    add_generation_prompt: bool = False,
+) -> str:
+    """Render chat messages through the tokenizer's template, if available."""
+    template = getattr(tokenizer, "apply_chat_template", None)
+    if not callable(template):
+        raise ValueError("Tokenizer does not support chat templates")
+
+    rendered = template(
+        list(messages),
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+    )
+    return str(rendered)
+
+
+def encode_messages(
+    tokenizer: Any,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    vocab_size: int,
+    add_generation_prompt: bool = True,
+) -> mx.array:
+    """Encode structured messages using a tokenizer chat template."""
+    template = getattr(tokenizer, "apply_chat_template", None)
+    if not callable(template):
+        raise ValueError("Tokenizer does not support chat templates")
+
+    try:
+        encoded = template(
+            list(messages),
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+        )
+    except TypeError:
+        rendered = apply_chat_template(
+            tokenizer,
+            messages,
+            add_generation_prompt=add_generation_prompt,
+        )
+        return encode_prompt_text(tokenizer, rendered, vocab_size=vocab_size)
+
+    return prompt_ids_from_list(_normalize_token_ids(encoded), vocab_size=vocab_size)
+
+
 def decode_token_ids(
     tokenizer: Any,
     token_ids: Any,
@@ -116,6 +178,20 @@ def decode_token_ids(
     if hasattr(tokenizer, "decode"):
         return str(tokenizer.decode(normalized, skip_special_tokens=skip_special_tokens))
     raise TypeError("Tokenizer must provide decode()")
+
+
+def decode_tokens(
+    tokenizer: Any,
+    token_ids: Any,
+    *,
+    skip_special_tokens: bool = True,
+) -> str:
+    """Alias for decode_token_ids with the V11 tokenizer-manager naming."""
+    return decode_token_ids(
+        tokenizer,
+        token_ids,
+        skip_special_tokens=skip_special_tokens,
+    )
 
 
 def materialize_generated_sequence(prompt_ids: mx.array, generated: Any) -> mx.array:

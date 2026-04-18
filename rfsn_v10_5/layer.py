@@ -133,6 +133,8 @@ class RFSNLayerMLX(nn.Module):
 
         cache.evict_for_append(seq_len)
         cache.append_exact(k, v)
+        if seq_len == 1:
+            cache.maybe_prefetch_for_decode(start_pos)
 
         segments = cache.get_attention_segments()
         if self.config.kv_groups > 1:

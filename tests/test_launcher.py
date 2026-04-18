@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import io
+import json
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 import mlx.core as mx
@@ -119,6 +122,29 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(config.ffn_dim, 8192)
         self.assertEqual(config.rope_base, 500000.0)
 
+    def test_build_config_prefers_hf_autoconfig_from_checkpoint(self) -> None:
+        parser = launcher._make_parser()
+        args = parser.parse_args(["generate", "--checkpoint", "/tmp/model"])
+
+        hf_config = launcher.RFSNConfig(
+            hidden_dim=4096,
+            num_heads=32,
+            num_kv_heads=8,
+            head_dim=128,
+            num_layers=32,
+            num_subspaces=8,
+            subspace_dim=16,
+            vocab_size=128256,
+            rope_base=500000.0,
+            ffn_dim=14336,
+        )
+
+        with patch("rfsn_v10_5.launcher.load_hf_config", return_value=hf_config):
+            config = launcher._build_config(args)
+
+        self.assertEqual(config.hidden_dim, 4096)
+        self.assertEqual(config.vocab_size, 128256)
+
     def test_check_command_uses_cache_dtype(self) -> None:
         parser = launcher._make_parser()
         args = parser.parse_args(["check", "--cache-dtype", "fp8_e4m3"])
@@ -154,15 +180,7 @@ class LauncherTest(unittest.TestCase):
 
     def test_generate_command_materializes_sequence_from_generated_steps(self) -> None:
         parser = launcher._make_parser()
-        args = parser.parse_args(
-            [
-                "generate",
-                "--prompt-ids",
-                "1,2",
-                "--max-new-tokens",
-                "2",
-            ]
-        )
+        args = parser.parse_args(["generate", "--prompt-ids", "1,2", "--max-new-tokens", "2"])
 
         class FakeCache:
             def __init__(self, config, batch_size: int) -> None:
@@ -183,10 +201,7 @@ class LauncherTest(unittest.TestCase):
                 top_k: int = 0,
                 repetition_penalty: float = 1.0,
             ):
-                return [
-                    mx.array([3], dtype=mx.int32),
-                    mx.array([4], dtype=mx.int32),
-                ]
+                return [mx.array([3], dtype=mx.int32), mx.array([4], dtype=mx.int32)]
 
         output = io.StringIO()
         with patch("rfsn_v10_5.launcher.RFSNMLX", FakeModel), patch(
@@ -197,6 +212,33 @@ class LauncherTest(unittest.TestCase):
         stdout = output.getvalue()
         self.assertIn("[generate] Generated 2 new tokens", stdout)
         self.assertIn("[generate] Output IDs: [1, 2, 3, 4]", stdout)
+
+    def test_generate_command_validates_prompt_ids_against_vocab_size(self) -> None:
+        parser = launcher._make_parser()
+        args = parser.parse_args(
+            [
+                "generate",
+                "--prompt-ids",
+                "1,99",
+                "--vocab-size",
+                "16",
+            ]
+        )
+
+        class FakeCache:
+            def __init__(self, config, batch_size: int) -> None:
+                self.config = config
+                self.batch_size = batch_size
+
+        class FakeModel:
+            def __init__(self, config) -> None:
+                self.config = config
+
+        with patch("rfsn_v10_5.launcher.RFSNMLX", FakeModel), patch(
+            "rfsn_v10_5.launcher.RFSNCache", FakeCache
+        ):
+            with self.assertRaisesRegex(ValueError, "vocab_size=16"):
+                launcher.cmd_generate(args)
 
     def test_generate_command_uses_tokenizer_for_text_io(self) -> None:
         parser = launcher._make_parser()
@@ -233,10 +275,7 @@ class LauncherTest(unittest.TestCase):
                 repetition_penalty: float = 1.0,
             ):
                 seen["prompt_ids"] = prompt_ids.tolist()
-                return [
-                    mx.array([7], dtype=mx.int32),
-                    mx.array([8], dtype=mx.int32),
-                ]
+                return [mx.array([7], dtype=mx.int32), mx.array([8], dtype=mx.int32)]
 
         def fake_load_tokenizer(name_or_path: str):
             seen["tokenizer_name"] = name_or_path
@@ -249,7 +288,6 @@ class LauncherTest(unittest.TestCase):
 
         def fake_decode_token_ids(tokenizer, token_ids, *, skip_special_tokens: bool = True):
             as_list = token_ids.tolist() if hasattr(token_ids, "tolist") else token_ids
-            seen.setdefault("decoded_batches", []).append(as_list)
             if as_list == [[5, 6, 7, 8]]:
                 return "Hello world extended"
             if as_list == [[7, 8]]:
@@ -259,13 +297,9 @@ class LauncherTest(unittest.TestCase):
         output = io.StringIO()
         with patch("rfsn_v10_5.launcher.RFSNMLX", FakeModel), patch(
             "rfsn_v10_5.launcher.RFSNCache", FakeCache
-        ), patch(
-            "rfsn_v10_5.launcher.load_tokenizer", fake_load_tokenizer
-        ), patch(
+        ), patch("rfsn_v10_5.launcher.load_tokenizer", fake_load_tokenizer), patch(
             "rfsn_v10_5.launcher.encode_prompt_text", fake_encode_prompt_text
-        ), patch(
-            "rfsn_v10_5.launcher.decode_token_ids", fake_decode_token_ids
-        ), redirect_stdout(output):
+        ), patch("rfsn_v10_5.launcher.decode_token_ids", fake_decode_token_ids), redirect_stdout(output):
             launcher.cmd_generate(args)
 
         stdout = output.getvalue()
@@ -276,7 +310,69 @@ class LauncherTest(unittest.TestCase):
         self.assertIn("[generate] Output text: Hello world extended", stdout)
         self.assertIn("[generate] New text:  extended", stdout)
 
-    def test_serve_command_uses_checkpoint_and_tokenizer(self) -> None:
+    def test_generate_command_uses_messages_json_with_chat_template(self) -> None:
+        parser = launcher._make_parser()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            messages_path = f"{tmpdir}/messages.json"
+            Path(messages_path).write_text(json.dumps([{"role": "user", "content": "Hello"}]), encoding="utf-8")
+            args = parser.parse_args(
+                [
+                    "generate",
+                    "--messages-json",
+                    messages_path,
+                    "--tokenizer",
+                    "fake-tokenizer",
+                    "--max-new-tokens",
+                    "2",
+                ]
+            )
+
+            seen: dict[str, object] = {}
+
+            class FakeCache:
+                def __init__(self, config, batch_size: int) -> None:
+                    self.config = config
+                    self.batch_size = batch_size
+                    self.layers = []
+
+            class FakeModel:
+                def __init__(self, config) -> None:
+                    self.config = config
+
+                def generate(
+                    self,
+                    prompt_ids,
+                    max_new_tokens: int,
+                    cache=None,
+                    temperature: float = 1.0,
+                    top_p: float = 1.0,
+                    top_k: int = 0,
+                    repetition_penalty: float = 1.0,
+                ):
+                    seen["prompt_ids"] = prompt_ids.tolist()
+                    return [mx.array([7], dtype=mx.int32), mx.array([8], dtype=mx.int32)]
+
+            def fake_load_tokenizer(name_or_path: str):
+                seen["tokenizer_name"] = name_or_path
+                return object()
+
+            def fake_encode_messages(tokenizer, messages, *, vocab_size: int, add_generation_prompt: bool = True):
+                seen["messages"] = messages
+                return mx.array([[9, 10]], dtype=mx.int32)
+
+            output = io.StringIO()
+            with patch("rfsn_v10_5.launcher.RFSNMLX", FakeModel), patch(
+                "rfsn_v10_5.launcher.RFSNCache", FakeCache
+            ), patch("rfsn_v10_5.launcher.load_tokenizer", fake_load_tokenizer), patch(
+                "rfsn_v10_5.launcher.encode_messages", fake_encode_messages
+            ), patch("rfsn_v10_5.launcher.decode_token_ids", lambda tokenizer, token_ids, **_: "decoded"), redirect_stdout(output):
+                launcher.cmd_generate(args)
+
+        self.assertEqual(seen["tokenizer_name"], "fake-tokenizer")
+        self.assertEqual(seen["messages"], [{"role": "user", "content": "Hello"}])
+        self.assertEqual(seen["prompt_ids"], [[9, 10]])
+
+    def test_serve_command_uses_checkpoint_tokenizer_and_admission_limits(self) -> None:
         parser = launcher._make_parser()
         args = parser.parse_args(
             [
@@ -285,6 +381,10 @@ class LauncherTest(unittest.TestCase):
                 "weights.safetensors",
                 "--tokenizer",
                 "demo-tokenizer",
+                "--max-concurrent-requests",
+                "2",
+                "--max-queue-size",
+                "4",
                 "--host",
                 "0.0.0.0",
                 "--port",
@@ -293,10 +393,21 @@ class LauncherTest(unittest.TestCase):
         )
         seen: dict[str, object] = {}
 
-        def fake_create_app(config, *, checkpoint=None, tokenizer_name_or_path=None, model=None, tokenizer=None):
+        def fake_create_app(
+            config,
+            *,
+            checkpoint=None,
+            tokenizer_name_or_path=None,
+            model=None,
+            tokenizer=None,
+            max_concurrent_requests=1,
+            max_queue_size=0,
+        ):
             seen["checkpoint"] = checkpoint
             seen["tokenizer"] = tokenizer_name_or_path
             seen["vocab_size"] = config.vocab_size
+            seen["max_concurrent_requests"] = max_concurrent_requests
+            seen["max_queue_size"] = max_queue_size
             return object()
 
         class FakeUvicorn:
@@ -306,12 +417,73 @@ class LauncherTest(unittest.TestCase):
                 seen["host"] = host
                 seen["port"] = port
 
-        with patch.dict("sys.modules", {"uvicorn": FakeUvicorn}), patch(
-            "rfsn_v10_5.api.create_app", fake_create_app
-        ):
+        with patch.dict("sys.modules", {"uvicorn": FakeUvicorn}), patch("rfsn_v10_5.api.create_app", fake_create_app):
             launcher.cmd_serve(args)
 
         self.assertEqual(seen["checkpoint"], "weights.safetensors")
         self.assertEqual(seen["tokenizer"], "demo-tokenizer")
+        self.assertEqual(seen["max_concurrent_requests"], 2)
+        self.assertEqual(seen["max_queue_size"], 4)
         self.assertEqual(seen["host"], "0.0.0.0")
         self.assertEqual(seen["port"], 9000)
+
+    def test_bench_command_passes_archive_seed_options(self) -> None:
+        parser = launcher._make_parser()
+        args = parser.parse_args(
+            [
+                "bench",
+                "--seed-prompt-len",
+                "32",
+                "--archive-seed-steps",
+                "6",
+            ]
+        )
+        seen: dict[str, object] = {}
+
+        class FakeCache:
+            def __init__(self, config, batch_size: int) -> None:
+                self.config = config
+                self.batch_size = batch_size
+
+        class FakeModel:
+            def __init__(self, config) -> None:
+                self.config = config
+
+        def fake_bench_prefill(model, cache, *, prompt_len: int, warmup: int, repeats: int):
+            seen["prefill_prompt_len"] = prompt_len
+            return "prefill-ok"
+
+        def fake_bench_decode(
+            model,
+            cache,
+            *,
+            steps: int,
+            warmup: int,
+            repeats: int,
+            seed_prompt_len: int,
+            archive_seed_steps: int,
+        ):
+            seen["steps"] = steps
+            seen["seed_prompt_len"] = seed_prompt_len
+            seen["archive_seed_steps"] = archive_seed_steps
+            return "decode-ok"
+
+        output = io.StringIO()
+        with patch("rfsn_v10_5.launcher.RFSNMLX", FakeModel), patch(
+            "rfsn_v10_5.launcher.RFSNCache", FakeCache
+        ), patch("rfsn_v10_5.bench.bench_prefill", fake_bench_prefill), patch(
+            "rfsn_v10_5.bench.bench_decode", fake_bench_decode
+        ), redirect_stdout(output):
+            launcher.cmd_bench(args)
+
+        stdout = output.getvalue()
+        self.assertEqual(seen["prefill_prompt_len"], 256)
+        self.assertEqual(seen["steps"], 100)
+        self.assertEqual(seen["seed_prompt_len"], 32)
+        self.assertEqual(seen["archive_seed_steps"], 6)
+        self.assertIn("prefill-ok", stdout)
+        self.assertIn("decode-ok", stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -41,6 +41,10 @@ The implementation follows a strict separation of concerns:
   residency authority for archived exact KV blocks.
 - `storage` provides corruption-safe disk persistence for block payloads
   and manifest rebuild on restart.
+- `residency` adds the explicit warm-set and look-ahead prefetch policy
+  used by the exact block-managed cache.
+- `hf_config` maps supported Hugging Face config.json files into
+  `RFSNConfig` without putting config parsing in the runtime hot path.
 
 Pass 5 additions (retained)
 ----------------------------
@@ -77,7 +81,9 @@ from .block_manager import (  # noqa: F401
   BlockSpan,
   PageTable,
 )
+from .residency import ResidencyManager  # noqa: F401
 from .storage import BlockStorage  # noqa: F401
+from .hf_config import HFConfigError, load_hf_config, load_hf_config_json  # noqa: F401
 
 __all__ = [
     "RFSNConfig",
@@ -97,5 +103,9 @@ __all__ = [
     "BlockManifest",
     "BlockSpan",
     "PageTable",
+    "ResidencyManager",
     "BlockStorage",
+    "HFConfigError",
+    "load_hf_config",
+    "load_hf_config_json",
 ]

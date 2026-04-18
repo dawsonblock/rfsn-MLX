@@ -137,6 +137,7 @@ class RFSNConfig:
     safety_mode: SafetyMode = SafetyMode.STRICT
 
     vocab_size: int = 50000
+    max_position_embeddings: int = 0
     disk_cache_dir: str = "./rfsn_disk_cache"
 
     # Pass 4 additions

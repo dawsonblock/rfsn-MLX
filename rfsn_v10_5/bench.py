@@ -122,22 +122,26 @@ def bench_prefill(
     prompt_ids = mx.zeros((batch_size, prompt_len), dtype=mx.int32)
 
     def _run() -> None:
-        # Reset cache state between iterations
-        cache.reset(clear_persisted=True)
+        # Keep timed iterations focused on model/cache work rather than directory churn.
+        cache.reset(clear_persisted=False)
         out = model.prefill(prompt_ids, cache)
         mx.eval(out)
 
-    # Warmup
-    for _ in range(warmup):
-        _run()
+    cache.reset(clear_persisted=True)
+    try:
+        # Warmup
+        for _ in range(warmup):
+            _run()
 
-    # Timed iterations
-    raw_ms: List[float] = []
-    for _ in range(repeats):
-        t0 = time.perf_counter()
-        _run()
-        t1 = time.perf_counter()
-        raw_ms.append((t1 - t0) * 1000.0)
+        # Timed iterations
+        raw_ms: List[float] = []
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            _run()
+            t1 = time.perf_counter()
+            raw_ms.append((t1 - t0) * 1000.0)
+    finally:
+        cache.reset(clear_persisted=True)
 
     mean_ms = sum(raw_ms) / len(raw_ms)
     return BenchResult(
@@ -190,7 +194,7 @@ def bench_decode(
 
     def _seed_cache() -> int:
         """Reset cache and run prefill; return next position."""
-        cache.reset(clear_persisted=True)
+        cache.reset(clear_persisted=False)
         model.prefill(seed_ids, cache)
         pos = seed_prompt_len
         if archive_seed_steps > 0:
@@ -209,20 +213,24 @@ def bench_decode(
             mx.eval(out)
             token_id = mx.argmax(out, axis=-1)
 
-    # Warmup
-    pos = _seed_cache()
-    for _ in range(warmup):
-        out = model.decode_step(mx.zeros((batch_size,), dtype=mx.int32), cache, pos)
-        mx.eval(out)
-
-    # Timed iterations
-    raw_ms: List[float] = []
-    for _ in range(repeats):
+    cache.reset(clear_persisted=True)
+    try:
+        # Warmup
         pos = _seed_cache()
-        t0 = time.perf_counter()
-        _run_decode(pos)
-        t1 = time.perf_counter()
-        raw_ms.append((t1 - t0) * 1000.0)
+        for _ in range(warmup):
+            out = model.decode_step(mx.zeros((batch_size,), dtype=mx.int32), cache, pos)
+            mx.eval(out)
+
+        # Timed iterations
+        raw_ms: List[float] = []
+        for _ in range(repeats):
+            pos = _seed_cache()
+            t0 = time.perf_counter()
+            _run_decode(pos)
+            t1 = time.perf_counter()
+            raw_ms.append((t1 - t0) * 1000.0)
+    finally:
+        cache.reset(clear_persisted=True)
 
     mean_ms = sum(raw_ms) / len(raw_ms)
     return BenchResult(

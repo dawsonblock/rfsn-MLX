@@ -30,6 +30,7 @@ import mlx.core as mx
 from .attention_exact import AttentionSegment
 from .block_manager import BlockId, BlockLocation, BlockManager, BlockManifest, BlockSpan
 from .config import RFSNConfig, resolve_dtype
+from .residency import ResidencyManager
 from .storage import BlockStorage
 
 
@@ -92,6 +93,9 @@ class LayerKVCache:
         self.block_manager = BlockManager(self.model_id)
         layer_storage_dir = Path(config.disk_cache_dir) / self.model_id / f"layer_{layer_id}"
         self.storage = BlockStorage(layer_storage_dir)
+        self.residency_manager = ResidencyManager(
+            prefetch_margin_tokens=max(1, config.block_size_seq // 2),
+        )
         self._resident_blocks: dict[BlockId, tuple[mx.array, mx.array]] = {}
         self._block_serial: int = 0
 
@@ -112,10 +116,16 @@ class LayerKVCache:
         self.block_manager.clear()
         self._resident_blocks.clear()
         self._block_serial = 0
+        self.residency_manager.reset()
         if clear_persisted:
             shutil.rmtree(self.storage.root_dir, ignore_errors=True)
             self.storage.root_dir.mkdir(parents=True, exist_ok=True)
             self.storage.quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+    def restore_from_disk(self) -> list[BlockManifest]:
+        self.block_manager.clear()
+        self._resident_blocks.clear()
+        return self.storage.rebuild_manager(self.block_manager)
 
     def _empty_context(self) -> tuple[mx.array, mx.array, int, int]:
         empty = mx.zeros(
@@ -237,13 +247,32 @@ class LayerKVCache:
         manifest.dtype = payload["keys"].dtype.name
         self.storage.persist_block(manifest, payload)
 
+    def demote_manifest_to_cold(self, manifest: BlockManifest) -> None:
+        self._spill_manifest_to_disk(manifest)
+
     def _spill_warm_if_needed(self) -> None:
-        while self._warm_token_count() > self.config.warm_capacity:
-            warm_blocks = self._warm_manifests()
-            if not warm_blocks:
-                return
-            victim = min(warm_blocks, key=lambda manifest: (manifest.logical_start, manifest.created_at))
-            self._spill_manifest_to_disk(victim)
+        self.residency_manager.evict_warm_excess(self)
+
+    def is_manifest_resident(self, manifest: BlockManifest) -> bool:
+        return manifest.block_id in self._resident_blocks
+
+    def load_manifest_payload_only(self, manifest: BlockManifest) -> Optional[dict[str, np.ndarray]]:
+        return self.storage.load_block(manifest)
+
+    def promote_manifest_from_payload(
+        self,
+        manifest: BlockManifest,
+        payload: dict[str, np.ndarray],
+    ) -> None:
+        self._resident_blocks[manifest.block_id] = (
+            mx.array(payload["keys"], dtype=self.dtype),
+            mx.array(payload["values"], dtype=self.dtype),
+        )
+        manifest.residency = BlockLocation.WARM_RAM
+        manifest.touch()
+
+    def maybe_prefetch_for_decode(self, query_abs_pos: int) -> None:
+        self.residency_manager.maybe_schedule_prefetch(self, query_abs_pos)
 
     def _seal_hot_prefix(self, prefix_len: int) -> None:
         hot_k, hot_v, prefix_start, prefix_end = self._materialize_hot_span(
@@ -302,6 +331,7 @@ class LayerKVCache:
             projected = self.hot_seq_len + incoming_len
 
     def _load_archived_payload(self, manifest: BlockManifest) -> Optional[tuple[mx.array, mx.array]]:
+        self.residency_manager.drain_completed_prefetches(self)
         resident = self._resident_blocks.get(manifest.block_id)
         if resident is not None:
             manifest.touch()
@@ -315,13 +345,13 @@ class LayerKVCache:
             return None
 
         if manifest.residency == BlockLocation.COLD_DISK:
-            payload = self.storage.load_block(manifest)
+            self.residency_manager.note_sync_load()
+            payload = self.load_manifest_payload_only(manifest)
             if payload is None:
                 return None
-            return (
-                mx.array(payload["keys"], dtype=self.dtype),
-                mx.array(payload["values"], dtype=self.dtype),
-            )
+            self.promote_manifest_from_payload(manifest, payload)
+            self.residency_manager.evict_warm_excess(self, protected_block_id=manifest.block_id)
+            return self._resident_blocks[manifest.block_id]
 
         return None
 
@@ -329,6 +359,7 @@ class LayerKVCache:
         return list(self._hot_span_segments())
 
     def get_archived_attention_segments(self) -> list[AttentionSegment]:
+        self.residency_manager.drain_completed_prefetches(self)
         segments: list[AttentionSegment] = []
         for manifest in self.block_manager.iter_blocks(layer_id=self.layer_id):
             if manifest.residency == BlockLocation.MISSING or not manifest.materializable:
@@ -398,6 +429,7 @@ class LayerKVCache:
         stats["hot_tokens"] = self.hot_seq_len
         stats["hot_start"] = self.hot_start
         stats["hot_end"] = self.hot_end
+        stats["residency_metrics"] = self.residency_manager.get_metrics()
         return stats
 
     def invalidate_reconstructed_cache(self) -> None:
@@ -427,3 +459,6 @@ class RFSNCache:
     def reset(self, *, clear_persisted: bool = True) -> None:
         for layer_cache in self.layers:
             layer_cache.reset(clear_persisted=clear_persisted)
+
+    def restore_from_disk(self) -> list[list[BlockManifest]]:
+        return [layer_cache.restore_from_disk() for layer_cache in self.layers]
