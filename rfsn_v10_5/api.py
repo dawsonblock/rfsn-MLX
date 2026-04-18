@@ -322,8 +322,12 @@ def create_app(
                 return service.generate(request)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except OverloadedError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/generate/stream")
     def generate_stream(request: GenerateRequest) -> StreamingResponse:
@@ -337,8 +341,16 @@ def create_app(
             if admission_context is not None:
                 admission_context.__exit__(None, None, None)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            if admission_context is not None:
+                admission_context.__exit__(None, None, None)
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except OverloadedError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if admission_context is not None:
+                admission_context.__exit__(None, None, None)
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         def _stream() -> Iterator[str]:
             try:

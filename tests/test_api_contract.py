@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -7,8 +8,9 @@ from fastapi import HTTPException
 from fastapi.routing import APIRoute
 
 from rfsn_v10_5.api import GenerateRequest, create_app
+from rfsn_v10_5.cache import RFSNCache
 from rfsn_v10_5.model import RFSNMLX
-from tests._helpers import FakeModel, FakeTokenizer, build_config
+from tests._helpers import FakeModel, FakeTokenizer, build_config, build_manifest, build_payload
 
 
 class APIContractTest(unittest.TestCase):
@@ -125,6 +127,44 @@ class APIContractTest(unittest.TestCase):
 
         self.assertEqual(exc_info.exception.status_code, 400)
         self.assertIn("max_position_embeddings=2", exc_info.exception.detail)
+
+    def test_generate_endpoint_maps_restore_errors_to_http_status_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = build_config(vocab_size=32, disk_cache_dir=tmpdir)
+            app = self._build_app(config=config, model=RFSNMLX(config), tokenizer=None)
+            generate = self._get_route_endpoint(app, "/generate", "POST")
+
+            with self.assertRaises(HTTPException) as missing_exc:
+                generate(
+                    GenerateRequest(
+                        prompt_ids=[1, 2],
+                        max_new_tokens=1,
+                        restore_cache=True,
+                        session_id="unknown-session",
+                    )
+                )
+            self.assertEqual(missing_exc.exception.status_code, 404)
+            self.assertIn("unknown-session", missing_exc.exception.detail)
+
+            gap_session = "gap-session"
+            seed_cache = RFSNCache(config, batch_size=1, session_id=gap_session)
+            layer_cache = seed_cache.layer(0)
+            first = build_manifest(seed_cache.model_id, block_name="blk0", start=0, end=4)
+            second = build_manifest(seed_cache.model_id, block_name="blk1", start=8, end=12)
+            layer_cache.storage.persist_block(first, build_payload(first.token_count))
+            layer_cache.storage.persist_block(second, build_payload(second.token_count))
+
+            with self.assertRaises(HTTPException) as gap_exc:
+                generate(
+                    GenerateRequest(
+                        prompt_ids=[1, 2],
+                        max_new_tokens=1,
+                        restore_cache=True,
+                        session_id=gap_session,
+                    )
+                )
+            self.assertEqual(gap_exc.exception.status_code, 409)
+            self.assertIn("gap", gap_exc.exception.detail)
 
     def test_generate_stream_endpoint_emits_token_and_complete_events(self) -> None:
         app = self._build_app()
