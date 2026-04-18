@@ -30,6 +30,7 @@ class GenerateRequest(BaseModel):
     prompt: Optional[str] = None
     messages: Optional[list[dict[str, Any]]] = None
     prompt_ids: Optional[list[int]] = None
+    session_id: Optional[str] = None
     restore_cache: bool = False
     max_new_tokens: int = Field(default=50, ge=1)
     temperature: float = Field(default=1.0, ge=0.0)
@@ -121,8 +122,19 @@ class RFSNAPIService:
             max_queue_size=max_queue_size,
         )
 
-    def _build_cache(self, batch_size: int, *, restore_cache: bool = False) -> RFSNCache:
-        cache = RFSNCache(self.config, batch_size=batch_size)
+    def _build_cache(
+        self,
+        batch_size: int,
+        *,
+        restore_cache: bool = False,
+        session_id: Optional[str] = None,
+    ) -> RFSNCache:
+        cache = RFSNCache(
+            self.config,
+            batch_size=batch_size,
+            session_id=session_id,
+            restore=restore_cache,
+        )
         if restore_cache:
             cache.restore_from_disk()
         return cache
@@ -157,6 +169,7 @@ class RFSNAPIService:
         cache = self._build_cache(
             prompt_ids.shape[0],
             restore_cache=request.restore_cache,
+            session_id=request.session_id,
         )
         token_ids = materialize_generated_sequence(
             prompt_ids,
@@ -172,6 +185,7 @@ class RFSNAPIService:
         )
 
         response: dict[str, Any] = {
+            "session_id": cache.session_id,
             "prompt_token_count": prompt_ids.shape[1],
             "generated_token_count": token_ids.shape[1] - prompt_ids.shape[1],
             "token_ids": token_ids[0].tolist(),
@@ -195,13 +209,11 @@ class RFSNAPIService:
         self,
         prompt_ids: mx.array,
         request: GenerateRequest,
+        *,
+        cache: RFSNCache,
     ) -> Iterator[mx.array]:
 
         def _token_iterator() -> Iterator[mx.array]:
-            cache = self._build_cache(
-                prompt_ids.shape[0],
-                restore_cache=request.restore_cache,
-            )
             seen_ids = prompt_ids
             logits = self.model.prefill(prompt_ids, cache)
             mx.eval(logits)
@@ -237,7 +249,12 @@ class RFSNAPIService:
 
     def stream_generate(self, request: GenerateRequest, *, prompt_ids: Optional[mx.array] = None) -> Iterator[str]:
         resolved_prompt_ids = prompt_ids if prompt_ids is not None else self._prepare_prompt_ids(request)
-        token_iterator = self._iter_generated_tokens(resolved_prompt_ids, request)
+        cache = self._build_cache(
+            resolved_prompt_ids.shape[0],
+            restore_cache=request.restore_cache,
+            session_id=request.session_id,
+        )
+        token_iterator = self._iter_generated_tokens(resolved_prompt_ids, request, cache=cache)
         generated: list[mx.array] = []
 
         for step, token in enumerate(token_iterator, start=1):
@@ -250,6 +267,7 @@ class RFSNAPIService:
 
         token_ids = materialize_generated_sequence(resolved_prompt_ids, generated)
         payload = {
+            "session_id": cache.session_id,
             "token_ids": token_ids[0].tolist(),
             "generated_token_count": token_ids.shape[1] - resolved_prompt_ids.shape[1],
         }
@@ -292,6 +310,7 @@ def create_app(
             "vocab_size": service.config.vocab_size,
             "max_position_embeddings": service.config.max_position_embeddings,
             "disk_cache_dir": service.config.disk_cache_dir,
+            "default_session_id": service.config.session_id or None,
             "tokenizer_loaded": service.tokenizer is not None,
             "admission_control": service.admission.snapshot(),
         }

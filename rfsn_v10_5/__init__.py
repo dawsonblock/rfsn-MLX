@@ -1,4 +1,4 @@
-"""Top-level package for the RFSN v10.5 implementation.
+"""Top-level package for the exact archived-context runtime.
 
 This module exposes the primary user-facing classes and configuration
 objects. Consumers should import from here rather than reaching into
@@ -30,12 +30,9 @@ The implementation follows a strict separation of concerns:
 - `tokenizer_utils` keeps text and message formatting at the application
   boundary while the model stays token-ID based.
 - `launcher` contains the CLI for generation, benchmarks, smoke checks,
-  and cache-persistence controls.
+  and session-scoped cache-persistence controls.
 - `api` exposes the single-request FastAPI wrapper with admission
   control and per-request cache restoration.
-- `codec`, `types`, and `attention_compressed` remain in-repo for older
-  experiments and compatibility, but they are not the active V11 long-
-  context runtime path.
 
 Pass 5 additions (retained)
 ----------------------------
@@ -49,7 +46,6 @@ Pass 6 additions
 - ``bench``: prefill and decode benchmarking module (``bench_prefill``,
   ``bench_decode``).
 - ``launcher``: CLI entry point (``python -m rfsn_v10_5.launcher``).
-- Evict-before-append in COMPRESSED mode (layer.py fix).
 - ``mlx.utils`` import fix in loader.py (``tree_flatten``/``tree_unflatten``).
 - ``cold_capacity`` enforcement in cache.py.
 
@@ -57,9 +53,8 @@ Do not import internal modules directly; use the top-level symbols
 exposed here instead. See README.md for usage examples.
 """
 
-from .config import RFSNConfig, RuntimeMode, SafetyMode  # noqa: F401
+from .config import RFSNConfig, RuntimeMode  # noqa: F401
 from .cache import RFSNCache, LayerKVCache  # noqa: F401
-from .codec import HybridKeyCodec  # noqa: F401
 from .layer import RFSNLayerMLX, build_rope_tables  # noqa: F401
 from .model import RFSNMLX  # noqa: F401
 from .loader import load_hf_weights  # noqa: F401
@@ -79,10 +74,8 @@ from .hf_config import HFConfigError, load_hf_config, load_hf_config_json  # noq
 __all__ = [
     "RFSNConfig",
     "RuntimeMode",
-    "SafetyMode",
     "RFSNCache",
     "LayerKVCache",
-    "HybridKeyCodec",
     "RFSNLayerMLX",
     "build_rope_tables",
     "RFSNMLX",

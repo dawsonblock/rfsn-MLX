@@ -19,14 +19,12 @@ class ExactnessVsReferenceTest(unittest.TestCase):
             head_dim=16,
             num_layers=1,
             vocab_size=128,
-            num_subspaces=4,
-            subspace_dim=4,
             hot_capacity=4,
             warm_capacity=4,
             cold_capacity=32,
             block_size_seq=4,
             model_dtype="float32",
-            runtime_mode=RuntimeMode.COMPRESSED,
+            runtime_mode=RuntimeMode.ARCHIVED,
         )
         reference_config = RFSNConfig(
             hidden_dim=32,
@@ -35,14 +33,12 @@ class ExactnessVsReferenceTest(unittest.TestCase):
             head_dim=16,
             num_layers=1,
             vocab_size=128,
-            num_subspaces=4,
-            subspace_dim=4,
             hot_capacity=32,
             warm_capacity=32,
             cold_capacity=64,
             block_size_seq=4,
             model_dtype="float32",
-            runtime_mode=RuntimeMode.COMPRESSED,
+            runtime_mode=RuntimeMode.ARCHIVED,
         )
 
         archived_model = RFSNMLX(archived_config)

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 import mlx.core as mx
+import numpy as np
 
 from rfsn_v10_5.block_manager import BlockLocation
 from rfsn_v10_5.cache import RFSNCache
@@ -21,20 +22,20 @@ class RestartReuseTest(unittest.TestCase):
                 head_dim=16,
                 num_layers=1,
                 vocab_size=128,
-                num_subspaces=4,
-                subspace_dim=4,
                 hot_capacity=4,
                 warm_capacity=4,
                 cold_capacity=32,
                 block_size_seq=4,
                 model_dtype="float16",
-                runtime_mode=RuntimeMode.COMPRESSED,
+                runtime_mode=RuntimeMode.ARCHIVED,
                 disk_cache_dir=tmpdir,
+                session_id="restart-session",
             )
             model = RFSNMLX(config)
             cache = RFSNCache(config, batch_size=1)
 
             prompt = mx.arange(0, 16, dtype=mx.int32)[None, :]
+            continuation = mx.arange(16, 20, dtype=mx.int32)[None, :]
             logits = model.prefill(prompt, cache)
             mx.eval(logits)
 
@@ -57,9 +58,21 @@ class RestartReuseTest(unittest.TestCase):
             mx.eval(restored_archived_k, restored_archived_v)
 
             self.assertEqual((start, end), (0, 16))
-            logits = model.decode_step(mx.zeros((1,), dtype=mx.int32), restarted_cache, pos=16)
-            mx.eval(logits)
-            self.assertEqual(logits.shape, (1, config.vocab_size))
+
+            uninterrupted_logits = model.prefill(continuation, cache)
+            restored_logits = model.prefill(continuation, restarted_cache)
+            mx.eval(uninterrupted_logits, restored_logits)
+
+            self.assertEqual(cache.layer(0).hot_end, 20)
+            self.assertEqual(restarted_cache.layer(0).hot_end, 20)
+            self.assertEqual(uninterrupted_logits.shape, (1, 4, config.vocab_size))
+            self.assertEqual(restored_logits.shape, (1, 4, config.vocab_size))
+            np.testing.assert_allclose(
+                np.array(uninterrupted_logits),
+                np.array(restored_logits),
+                atol=1e-5,
+                rtol=1e-5,
+            )
 
 
 if __name__ == "__main__":

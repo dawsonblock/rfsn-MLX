@@ -36,7 +36,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .cache import RFSNCache
-from .config import RFSNConfig
+from .config import RFSNConfig, RuntimeMode
 from .layer import RFSNLayerMLX, build_rope_tables
 
 
@@ -67,6 +67,41 @@ class RFSNMLX(nn.Module):
     def _lm_head(self, x: mx.array) -> mx.array:
         """Project hidden states to vocabulary logits (weight-tied)."""
         return x @ self.embed_tokens.weight.T
+
+    def _context_end(self, cache: RFSNCache) -> int:
+        return cache.layer(0).hot_end
+
+    def _validate_prefill_bounds(self, cache: RFSNCache, incoming_tokens: int) -> int:
+        context_end = self._context_end(cache)
+        projected = context_end + incoming_tokens
+        if self.config.max_position_embeddings > 0 and projected > self.config.max_position_embeddings:
+            raise ValueError(
+                f"Prompt would exceed max_position_embeddings={self.config.max_position_embeddings} "
+                f"(requested {projected} tokens total)"
+            )
+        if self.config.runtime_mode == RuntimeMode.EXACT and projected > self.config.hot_capacity:
+            raise RuntimeError(
+                "runtime_mode='exact' is hot-window only; the prompt would exceed "
+                f"hot_capacity={self.config.hot_capacity}"
+            )
+        return context_end
+
+    def _validate_decode_bounds(self, cache: RFSNCache, pos: int) -> None:
+        context_end = self._context_end(cache)
+        if pos != context_end:
+            raise ValueError(
+                f"decode_step expected pos={context_end} from cache state, got pos={pos}"
+            )
+        projected = pos + 1
+        if self.config.max_position_embeddings > 0 and projected > self.config.max_position_embeddings:
+            raise ValueError(
+                f"Decode would exceed max_position_embeddings={self.config.max_position_embeddings}"
+            )
+        if self.config.runtime_mode == RuntimeMode.EXACT and projected > self.config.hot_capacity:
+            raise RuntimeError(
+                "runtime_mode='exact' is hot-window only; the decode step would exceed "
+                f"hot_capacity={self.config.hot_capacity}"
+            )
 
     def _forward(
         self,
@@ -115,13 +150,14 @@ class RFSNMLX(nn.Module):
         if seq_len == 0:
             raise ValueError("prefill requires at least one token")
 
+        self._validate_prefill_bounds(cache, seq_len)
         chunk_size = max(1, min(self.config.hot_capacity, seq_len))
         logits_chunks: List[mx.array] = []
         chunk_start = 0
         while chunk_start < seq_len:
             chunk_end = min(seq_len, chunk_start + chunk_size)
             token_chunk = tokens[:, chunk_start:chunk_end]
-            start_pos = cache.layer(0).hot_end
+            start_pos = self._context_end(cache)
             x = self.embed_tokens(token_chunk)
             logits_chunks.append(self._forward(x, cache, start_pos))
             chunk_start = chunk_end
@@ -147,6 +183,7 @@ class RFSNMLX(nn.Module):
         -------
         logits : mx.array, shape (B, vocab_size)
         """
+        self._validate_decode_bounds(cache, pos)
         x = self.embed_tokens(token_id[:, None])  # (B, 1, hidden)
         logits = self._forward(x, cache, pos)      # (B, 1, vocab_size)
         return logits[:, 0, :]                     # (B, vocab_size)
@@ -184,6 +221,19 @@ class RFSNMLX(nn.Module):
         B, L = prompt_ids.shape
         if cache is None:
             cache = RFSNCache(self.config, batch_size=B)
+
+        context_end = self._context_end(cache)
+        requested_total = context_end + L + max_new_tokens
+        if self.config.max_position_embeddings > 0 and requested_total > self.config.max_position_embeddings:
+            raise ValueError(
+                f"Prompt plus requested generation would exceed "
+                f"max_position_embeddings={self.config.max_position_embeddings}"
+            )
+        if self.config.runtime_mode == RuntimeMode.EXACT and requested_total > self.config.hot_capacity:
+            raise RuntimeError(
+                "runtime_mode='exact' is hot-window only; prompt plus requested generation would exceed "
+                f"hot_capacity={self.config.hot_capacity}"
+            )
 
         # Track all token ids seen so far for repetition penalty
         seen_ids: mx.array = prompt_ids  # (B, L)

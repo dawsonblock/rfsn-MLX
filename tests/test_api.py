@@ -62,8 +62,6 @@ class APITest(unittest.TestCase):
             head_dim=16,
             num_layers=1,
             vocab_size=32,
-            num_subspaces=4,
-            subspace_dim=4,
         )
         return create_app(
             config,
@@ -86,6 +84,7 @@ class APITest(unittest.TestCase):
         self.assertEqual(payload["status"], "ok")
         self.assertTrue(payload["tokenizer_loaded"])
         self.assertEqual(payload["disk_cache_dir"], app.state.service.config.disk_cache_dir)
+        self.assertIsNone(payload["default_session_id"])
         self.assertEqual(payload["admission_control"]["max_concurrent_requests"], 1)
 
     def test_generate_endpoint_returns_token_ids_and_text(self) -> None:
@@ -93,6 +92,7 @@ class APITest(unittest.TestCase):
         generate = self._get_route_endpoint(app, "/generate", "POST")
         payload = generate(GenerateRequest(prompt="Hello", max_new_tokens=2))
 
+        self.assertTrue(payload["session_id"])
         self.assertEqual(payload["token_ids"], [5, 6, 7, 8])
         self.assertEqual(payload["text"], "5|6|7|8")
         self.assertEqual(payload["generated_text"], "7|8")
@@ -115,19 +115,42 @@ class APITest(unittest.TestCase):
         seen: dict[str, object] = {}
 
         class FakeCache:
-            def __init__(self, config, batch_size: int) -> None:
+            def __init__(self, config, batch_size: int, session_id=None, restore: bool = False) -> None:
                 seen["batch_size"] = batch_size
+                seen["session_id"] = session_id
+                seen["restore"] = restore
+                self.session_id = session_id or "request-session"
 
             def restore_from_disk(self):
                 seen["restored"] = True
-                return [[]]
+                return [[object()]]
 
         with patch("rfsn_v10_5.api.RFSNCache", FakeCache):
-            payload = generate(GenerateRequest(prompt="Hello", max_new_tokens=2, restore_cache=True))
+            payload = generate(
+                GenerateRequest(
+                    prompt="Hello",
+                    max_new_tokens=2,
+                    restore_cache=True,
+                    session_id="request-session",
+                )
+            )
 
         self.assertTrue(seen["restored"])
         self.assertEqual(seen["batch_size"], 1)
+        self.assertEqual(seen["session_id"], "request-session")
+        self.assertTrue(seen["restore"])
+        self.assertEqual(payload["session_id"], "request-session")
         self.assertEqual(payload["token_ids"], [5, 6, 7, 8])
+
+    def test_generate_endpoint_rejects_restore_without_session_id(self) -> None:
+        app = self._build_app()
+        generate = self._get_route_endpoint(app, "/generate", "POST")
+
+        with self.assertRaises(HTTPException) as exc_info:
+            generate(GenerateRequest(prompt="Hello", max_new_tokens=2, restore_cache=True))
+
+        self.assertEqual(exc_info.exception.status_code, 400)
+        self.assertIn("session_id", exc_info.exception.detail)
 
     def test_generate_stream_endpoint_emits_token_and_complete_events(self) -> None:
         app = self._build_app()
@@ -140,6 +163,7 @@ class APITest(unittest.TestCase):
         self.assertIn("event: token", body)
         self.assertIn('"token_id": 7', body)
         self.assertIn("event: complete", body)
+        self.assertIn('"session_id":', body)
         self.assertIn('"generated_text": "7|8"', body)
 
     def test_generate_endpoint_rejects_missing_prompt(self) -> None:
@@ -160,8 +184,6 @@ class APITest(unittest.TestCase):
             head_dim=16,
             num_layers=1,
             vocab_size=32,
-            num_subspaces=4,
-            subspace_dim=4,
         )
         app = create_app(
             config,

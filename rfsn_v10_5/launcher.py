@@ -28,8 +28,6 @@ _MODEL_ARG_DEFAULTS = {
     "num_heads": 8,
     "num_kv_heads": 0,
     "head_dim": 64,
-    "num_subspaces": None,
-    "subspace_dim": None,
     "num_layers": 4,
     "vocab_size": 50000,
     "rope_base": 10000.0,
@@ -38,55 +36,20 @@ _MODEL_ARG_DEFAULTS = {
     "warm_capacity": 2048,
     "cold_capacity": 8192,
     "block_size_seq": 64,
+    "runtime_mode": RuntimeMode.ARCHIVED.value,
     "model_dtype": "bfloat16",
-    "cache_dtype": None,
     "disk_cache_dir": "./rfsn_disk_cache",
+    "session_id": "",
 }
 
 
-def _resolve_subspace_layout(
-    head_dim: int,
-    num_subspaces: Optional[int],
-    subspace_dim: Optional[int],
-) -> tuple[int, int]:
-    if num_subspaces is None and subspace_dim is None:
-        for candidate_subspace_dim in (16, 8, 4, 2, 1):
-            if head_dim % candidate_subspace_dim == 0:
-                return head_dim // candidate_subspace_dim, candidate_subspace_dim
-        raise ValueError(f"Could not resolve a valid subspace layout for head_dim={head_dim}")
-
-    if num_subspaces is None:
-        assert subspace_dim is not None
-        if head_dim % subspace_dim != 0:
-            raise ValueError(
-                f"head_dim ({head_dim}) must be divisible by subspace_dim ({subspace_dim})"
-            )
-        return head_dim // subspace_dim, subspace_dim
-
-    if subspace_dim is None:
-        if head_dim % num_subspaces != 0:
-            raise ValueError(
-                f"head_dim ({head_dim}) must be divisible by num_subspaces ({num_subspaces})"
-            )
-        return num_subspaces, head_dim // num_subspaces
-
-    return num_subspaces, subspace_dim
-
-
 def _build_manual_config(args: argparse.Namespace) -> RFSNConfig:
-    num_subspaces, subspace_dim = _resolve_subspace_layout(
-        args.head_dim,
-        getattr(args, "num_subspaces", None),
-        getattr(args, "subspace_dim", None),
-    )
     return RFSNConfig(
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
         num_kv_heads=getattr(args, "num_kv_heads", 0),
         head_dim=args.head_dim,
         num_layers=args.num_layers,
-        num_subspaces=num_subspaces,
-        subspace_dim=subspace_dim,
         vocab_size=args.vocab_size,
         rope_base=getattr(args, "rope_base", 10000.0),
         ffn_dim=getattr(args, "ffn_dim", 0),
@@ -94,10 +57,10 @@ def _build_manual_config(args: argparse.Namespace) -> RFSNConfig:
         warm_capacity=getattr(args, "warm_capacity", 2048),
         cold_capacity=getattr(args, "cold_capacity", 8192),
         block_size_seq=getattr(args, "block_size_seq", 64),
-        runtime_mode=RuntimeMode.COMPRESSED,
+        runtime_mode=RuntimeMode(getattr(args, "runtime_mode", RuntimeMode.ARCHIVED.value)),
         model_dtype=getattr(args, "model_dtype", "bfloat16"),
-        cache_dtype=getattr(args, "cache_dtype", "") or "",
         disk_cache_dir=getattr(args, "disk_cache_dir", "./rfsn_disk_cache"),
+        session_id=getattr(args, "session_id", ""),
     )
 
 
@@ -115,8 +78,10 @@ def _build_config(args: argparse.Namespace) -> RFSNConfig:
             warm_capacity=args.warm_capacity,
             cold_capacity=args.cold_capacity,
             block_size_seq=args.block_size_seq,
+            runtime_mode=getattr(args, "runtime_mode", RuntimeMode.ARCHIVED.value),
             model_dtype=args.model_dtype,
-            cache_dtype=args.cache_dtype or "",
+            disk_cache_dir=args.disk_cache_dir,
+            session_id=getattr(args, "session_id", ""),
         )
     except (FileNotFoundError, HFConfigError):
         return _build_manual_config(args)
@@ -127,15 +92,7 @@ def _build_config(args: argparse.Namespace) -> RFSNConfig:
             continue
         current_value = getattr(args, field)
         if current_value != default_value:
-            config_kwargs[field] = current_value if current_value is not None else ""
-
-    num_subspaces, subspace_dim = _resolve_subspace_layout(
-        config_kwargs["head_dim"],
-        getattr(args, "num_subspaces", None),
-        getattr(args, "subspace_dim", None),
-    )
-    config_kwargs["num_subspaces"] = num_subspaces
-    config_kwargs["subspace_dim"] = subspace_dim
+            config_kwargs[field] = current_value
     return RFSNConfig(**config_kwargs)
 
 
@@ -193,14 +150,16 @@ def cmd_generate(args: argparse.Namespace) -> None:
         if skipped:
             print(f"[loader] Skipped {len(skipped)} keys: {list(skipped.keys())[:5]}")
 
-    cache = RFSNCache(config, batch_size=1)
+    cache = RFSNCache(config, batch_size=1, restore=args.restore_cache)
     restored_block_count = _restore_cache_if_requested(cache, enabled=args.restore_cache)
     tokenizer = load_tokenizer(args.tokenizer) if args.tokenizer else None
 
+    print(f"[generate] Session ID: {cache.session_id}")
+
     if args.restore_cache:
         print(
-            f"[generate] Restored {restored_block_count} persisted blocks from {config.disk_cache_dir}; "
-            "provided input will be appended as continuation context"
+            f"[generate] Restored {restored_block_count} persisted blocks for session '{cache.session_id}' "
+            f"from {config.disk_cache_dir}; provided input will be appended as continuation context"
         )
 
     if args.prompt_ids:
@@ -285,7 +244,7 @@ def cmd_bench(args: argparse.Namespace) -> None:
     print(
         f"[bench] Model: {config.num_layers}L x {config.hidden_dim}d, "
         f"{config.num_heads}H/{config.num_kv_heads}KVH, "
-        f"dtype={config.model_dtype}, cache_dtype={config.cache_dtype}"
+        f"dtype={config.model_dtype}, runtime_mode={config.runtime_mode.value}, session_id={cache.session_id}"
     )
 
     prefill_result = bench_prefill(
@@ -320,15 +279,18 @@ def cmd_check(args: argparse.Namespace) -> None:
         warm_capacity=256,
         cold_capacity=1024,
         block_size_seq=16,
-        runtime_mode=RuntimeMode.COMPRESSED,
+        runtime_mode=RuntimeMode(getattr(args, "runtime_mode", RuntimeMode.ARCHIVED.value)),
         model_dtype="float32",
-        cache_dtype=getattr(args, "cache_dtype", "") or "",
         disk_cache_dir=getattr(args, "disk_cache_dir", "./rfsn_disk_cache"),
+        session_id=getattr(args, "session_id", ""),
     )
     model = RFSNMLX(config)
     cache = RFSNCache(config, batch_size=1)
 
-    print(f"[check] Config: dtype={config.model_dtype}, cache_dtype={config.cache_dtype}")
+    print(
+        f"[check] Config: dtype={config.model_dtype}, "
+        f"runtime_mode={config.runtime_mode.value}, session_id={cache.session_id}"
+    )
 
     prompt = mx.zeros((1, 8), dtype=mx.int32)
     out = model.prefill(prompt, cache)
@@ -357,18 +319,6 @@ def _make_parser() -> argparse.ArgumentParser:
         p.add_argument("--num-kv-heads", type=int, default=0,
                        help="KV heads for GQA (0 = same as num-heads)")
         p.add_argument("--head-dim", type=int, default=64)
-        p.add_argument(
-            "--num-subspaces",
-            type=int,
-            default=None,
-            help="Legacy PQ subspace count; auto-resolved from --head-dim when omitted",
-        )
-        p.add_argument(
-            "--subspace-dim",
-            type=int,
-            default=None,
-            help="Legacy PQ subspace dimension; auto-resolved from --head-dim when omitted",
-        )
         p.add_argument("--num-layers", type=int, default=4)
         p.add_argument("--vocab-size", type=int, default=50000)
         p.add_argument("--rope-base", type=float, default=10000.0)
@@ -377,16 +327,22 @@ def _make_parser() -> argparse.ArgumentParser:
         p.add_argument("--warm-capacity", type=int, default=2048)
         p.add_argument("--cold-capacity", type=int, default=8192)
         p.add_argument("--block-size-seq", type=int, default=64)
+        p.add_argument(
+            "--runtime-mode",
+            type=str,
+            default=RuntimeMode.ARCHIVED.value,
+            choices=[mode.value for mode in RuntimeMode],
+            help="'archived' spills exact sealed prefixes to archived blocks; 'exact' is hot-window only",
+        )
         p.add_argument("--disk-cache-dir", type=str, default="./rfsn_disk_cache")
+        p.add_argument(
+            "--session-id",
+            type=str,
+            default="",
+            help="Explicit cache session identifier. Required for restore-cache; auto-generated otherwise.",
+        )
         p.add_argument("--model-dtype", type=str, default="bfloat16",
                        choices=["float16", "bfloat16", "float32"])
-        p.add_argument(
-            "--cache-dtype",
-            type=str,
-            default=None,
-            choices=["float16", "bfloat16", "float32", "fp8_e4m3"],
-            help="Legacy cache storage dtype knob; retained for compatibility",
-        )
 
     gen = sub.add_parser("generate", help="Generate text from a prompt")
     _add_model_args(gen)
@@ -423,13 +379,13 @@ def _make_parser() -> argparse.ArgumentParser:
 
     chk = sub.add_parser("check", help="Run a smoke test")
     chk.add_argument(
-        "--cache-dtype",
+        "--runtime-mode",
         type=str,
-        default=None,
-        choices=["float16", "bfloat16", "float32", "fp8_e4m3"],
-        help="Legacy cache storage dtype for the smoke test",
+        default=RuntimeMode.ARCHIVED.value,
+        choices=[mode.value for mode in RuntimeMode],
     )
     chk.add_argument("--disk-cache-dir", type=str, default="./rfsn_disk_cache")
+    chk.add_argument("--session-id", type=str, default="")
     chk.set_defaults(func=cmd_check)
 
     srv = sub.add_parser("serve", help="Run the FastAPI inference wrapper")

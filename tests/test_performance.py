@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Callable
 
 import mlx.core as mx
 
@@ -21,14 +22,11 @@ class PerformanceSmokeTest(unittest.TestCase):
             head_dim=16,
             num_layers=1,
             vocab_size=128,
-            num_subspaces=4,
-            subspace_dim=4,
             hot_capacity=8,
             warm_capacity=16,
             cold_capacity=32,
             block_size_seq=4,
-            rvq_max_active=8,
-            runtime_mode=RuntimeMode.COMPRESSED,
+            runtime_mode=RuntimeMode.ARCHIVED,
         )
         model = RFSNMLX(config)
         cache = RFSNCache(config, batch_size=1)
@@ -49,8 +47,8 @@ class PerformanceSmokeTest(unittest.TestCase):
         self.assertGreater(layer_cache.get_block_stats()["total_blocks"], 0)
         return token
 
-    def _start_capture(self, directory: Path) -> tuple[Path, callable]:
-        def _fallback_capture(reason: str) -> tuple[Path, callable]:
+    def _start_capture(self, directory: Path) -> tuple[Path, Callable[[], None]]:
+        def _fallback_capture(reason: str) -> tuple[Path, Callable[[], None]]:
             artifact = directory / "decode_step.capture.txt"
 
             def _write_report() -> None:

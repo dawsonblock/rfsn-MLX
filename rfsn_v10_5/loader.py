@@ -49,7 +49,7 @@ Usage
     config = RFSNConfig(
         hidden_dim=4096, num_heads=32, head_dim=128, num_layers=32,
         vocab_size=32000, model_dtype="bfloat16",
-        runtime_mode="compressed",
+        runtime_mode="archived",
     )
     model = RFSNMLX(config)
     load_hf_weights(model, "/path/to/model.safetensors")

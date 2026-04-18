@@ -31,9 +31,7 @@ class BlockStorage:
 
     def __init__(self, root_dir: str | Path) -> None:
         self.root_dir = Path(root_dir)
-        self.root_dir.mkdir(parents=True, exist_ok=True)
         self.quarantine_dir = self.root_dir / "quarantine"
-        self.quarantine_dir.mkdir(parents=True, exist_ok=True)
 
     def persist_block(
         self,
@@ -145,6 +143,7 @@ class BlockStorage:
         if payload_path is None or not payload_path.exists():
             return None
 
+        self.quarantine_dir.mkdir(parents=True, exist_ok=True)
         timestamp = int(time.time() * 1000)
         quarantined_path = self.quarantine_dir / f"{payload_path.name}.{timestamp}.bad"
         payload_path.replace(quarantined_path)

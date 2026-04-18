@@ -20,7 +20,7 @@ Usage
     config = RFSNConfig(
         hidden_dim=512, num_heads=8, head_dim=64, num_layers=4,
         vocab_size=50000, model_dtype="bfloat16",
-        runtime_mode="compressed",
+        runtime_mode="archived",
     )
     model = RFSNMLX(config)
     cache = RFSNCache(config, batch_size=1)

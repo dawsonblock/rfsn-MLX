@@ -14,32 +14,22 @@ from rfsn_v10_5 import launcher
 
 
 class LauncherTest(unittest.TestCase):
-    def test_build_config_accepts_cache_dtype(self) -> None:
+    def test_build_config_accepts_runtime_mode_and_session_id(self) -> None:
         parser = launcher._make_parser()
         args = parser.parse_args(
             [
                 "bench",
-                "--hidden-dim",
-                "128",
-                "--num-heads",
-                "2",
-                "--num-kv-heads",
-                "2",
-                "--head-dim",
-                "64",
-                "--num-layers",
-                "1",
-                "--vocab-size",
-                "128",
-                "--cache-dtype",
-                "fp8_e4m3",
+                "--runtime-mode",
+                "exact",
+                "--session-id",
+                "cli-session",
             ]
         )
 
         config = launcher._build_config(args)
 
-        self.assertEqual(config.cache_dtype, "fp8_e4m3")
-        self.assertEqual((config.num_subspaces, config.subspace_dim), (4, 16))
+        self.assertEqual(config.runtime_mode, launcher.RuntimeMode.EXACT)
+        self.assertEqual(config.session_id, "cli-session")
 
     def test_build_config_accepts_disk_cache_dir_override(self) -> None:
         parser = launcher._make_parser()
@@ -48,58 +38,6 @@ class LauncherTest(unittest.TestCase):
         config = launcher._build_config(args)
 
         self.assertEqual(config.disk_cache_dir, "/tmp/rfsn-cache")
-
-    def test_build_config_auto_resolves_small_head_dim_subspaces(self) -> None:
-        parser = launcher._make_parser()
-        args = parser.parse_args(
-            [
-                "bench",
-                "--hidden-dim",
-                "16",
-                "--num-heads",
-                "4",
-                "--num-kv-heads",
-                "4",
-                "--head-dim",
-                "4",
-                "--num-layers",
-                "1",
-                "--vocab-size",
-                "128",
-            ]
-        )
-
-        config = launcher._build_config(args)
-
-        self.assertEqual((config.num_subspaces, config.subspace_dim), (1, 4))
-
-    def test_build_config_accepts_explicit_subspace_override(self) -> None:
-        parser = launcher._make_parser()
-        args = parser.parse_args(
-            [
-                "bench",
-                "--hidden-dim",
-                "256",
-                "--num-heads",
-                "2",
-                "--num-kv-heads",
-                "2",
-                "--head-dim",
-                "128",
-                "--num-subspaces",
-                "16",
-                "--subspace-dim",
-                "8",
-                "--num-layers",
-                "1",
-                "--vocab-size",
-                "128",
-            ]
-        )
-
-        config = launcher._build_config(args)
-
-        self.assertEqual((config.num_subspaces, config.subspace_dim), (16, 8))
 
     def test_build_config_accepts_explicit_ffn_dim_and_rope_base(self) -> None:
         parser = launcher._make_parser()
@@ -140,8 +78,6 @@ class LauncherTest(unittest.TestCase):
             num_kv_heads=8,
             head_dim=128,
             num_layers=32,
-            num_subspaces=8,
-            subspace_dim=16,
             vocab_size=128256,
             rope_base=500000.0,
             ffn_dim=14336,
@@ -153,20 +89,21 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(config.hidden_dim, 4096)
         self.assertEqual(config.vocab_size, 128256)
 
-    def test_check_command_uses_cache_dtype(self) -> None:
+    def test_check_command_uses_runtime_mode_and_session_id(self) -> None:
         parser = launcher._make_parser()
-        args = parser.parse_args(["check", "--cache-dtype", "fp8_e4m3"])
+        args = parser.parse_args(["check", "--runtime-mode", "exact", "--session-id", "health-check"])
         seen: dict[str, object] = {}
 
         class FakeCache:
-            def __init__(self, config, batch_size: int) -> None:
-                seen["cache_dtype"] = config.cache_dtype
+            def __init__(self, config, batch_size: int, **kwargs) -> None:
+                seen["runtime_mode"] = config.runtime_mode
+                self.session_id = kwargs.get("session_id", config.session_id or "health-check") or "health-check"
                 self.config = config
                 self.batch_size = batch_size
 
         class FakeModel:
             def __init__(self, config) -> None:
-                seen["model_cache_dtype"] = config.cache_dtype
+                seen["model_runtime_mode"] = config.runtime_mode
 
             def prefill(self, prompt, cache):
                 return mx.zeros((1, 8, 1000), dtype=mx.float32)
@@ -181,9 +118,10 @@ class LauncherTest(unittest.TestCase):
             launcher.cmd_check(args)
 
         stdout = output.getvalue()
-        self.assertEqual(seen["cache_dtype"], "fp8_e4m3")
-        self.assertEqual(seen["model_cache_dtype"], "fp8_e4m3")
-        self.assertIn("cache_dtype=fp8_e4m3", stdout)
+        self.assertEqual(seen["runtime_mode"], launcher.RuntimeMode.EXACT)
+        self.assertEqual(seen["model_runtime_mode"], launcher.RuntimeMode.EXACT)
+        self.assertIn("runtime_mode=exact", stdout)
+        self.assertIn("session_id=health-check", stdout)
         self.assertIn("[check] PASS", stdout)
 
     def test_generate_command_materializes_sequence_from_generated_steps(self) -> None:
@@ -191,9 +129,10 @@ class LauncherTest(unittest.TestCase):
         args = parser.parse_args(["generate", "--prompt-ids", "1,2", "--max-new-tokens", "2"])
 
         class FakeCache:
-            def __init__(self, config, batch_size: int) -> None:
+            def __init__(self, config, batch_size: int, **kwargs) -> None:
                 self.config = config
                 self.batch_size = batch_size
+                self.session_id = kwargs.get("session_id", config.session_id or "generated-session") or "generated-session"
 
         class FakeModel:
             def __init__(self, config) -> None:
@@ -218,6 +157,7 @@ class LauncherTest(unittest.TestCase):
             launcher.cmd_generate(args)
 
         stdout = output.getvalue()
+        self.assertIn("[generate] Session ID:", stdout)
         self.assertIn("[generate] Generated 2 new tokens", stdout)
         self.assertIn("[generate] Output IDs: [1, 2, 3, 4]", stdout)
 
@@ -234,9 +174,10 @@ class LauncherTest(unittest.TestCase):
         )
 
         class FakeCache:
-            def __init__(self, config, batch_size: int) -> None:
+            def __init__(self, config, batch_size: int, **kwargs) -> None:
                 self.config = config
                 self.batch_size = batch_size
+                self.session_id = kwargs.get("session_id", config.session_id or "generated-session") or "generated-session"
 
         class FakeModel:
             def __init__(self, config) -> None:
@@ -258,6 +199,8 @@ class LauncherTest(unittest.TestCase):
                 "--restore-cache",
                 "--disk-cache-dir",
                 "/tmp/rfsn-cache",
+                "--session-id",
+                "restore-session",
                 "--max-new-tokens",
                 "2",
             ]
@@ -265,10 +208,12 @@ class LauncherTest(unittest.TestCase):
         seen: dict[str, object] = {}
 
         class FakeCache:
-            def __init__(self, config, batch_size: int) -> None:
+            def __init__(self, config, batch_size: int, **kwargs) -> None:
                 seen["disk_cache_dir"] = config.disk_cache_dir
+                seen["session_id"] = kwargs.get("session_id", config.session_id)
                 self.config = config
                 self.batch_size = batch_size
+                self.session_id = kwargs.get("session_id", config.session_id or "restore-session") or "restore-session"
 
             def restore_from_disk(self):
                 seen["restored"] = True
@@ -299,7 +244,29 @@ class LauncherTest(unittest.TestCase):
         stdout = output.getvalue()
         self.assertTrue(seen["restored"])
         self.assertEqual(seen["disk_cache_dir"], "/tmp/rfsn-cache")
+        self.assertEqual(seen["session_id"], "restore-session")
         self.assertIn("Restored 2 persisted blocks", stdout)
+
+    def test_generate_command_requires_session_id_for_restore(self) -> None:
+        parser = launcher._make_parser()
+        args = parser.parse_args(
+            [
+                "generate",
+                "--prompt-ids",
+                "1,2",
+                "--restore-cache",
+                "--max-new-tokens",
+                "2",
+            ]
+        )
+
+        class FakeModel:
+            def __init__(self, config) -> None:
+                self.config = config
+
+        with patch("rfsn_v10_5.launcher.RFSNMLX", FakeModel):
+            with self.assertRaisesRegex(ValueError, "session_id"):
+                launcher.cmd_generate(args)
 
     def test_generate_command_uses_tokenizer_for_text_io(self) -> None:
         parser = launcher._make_parser()
@@ -317,9 +284,10 @@ class LauncherTest(unittest.TestCase):
         seen: dict[str, object] = {}
 
         class FakeCache:
-            def __init__(self, config, batch_size: int) -> None:
+            def __init__(self, config, batch_size: int, **kwargs) -> None:
                 self.config = config
                 self.batch_size = batch_size
+                self.session_id = kwargs.get("session_id", config.session_id or "generated-session") or "generated-session"
 
         class FakeModel:
             def __init__(self, config) -> None:
@@ -391,10 +359,11 @@ class LauncherTest(unittest.TestCase):
             seen: dict[str, object] = {}
 
             class FakeCache:
-                def __init__(self, config, batch_size: int) -> None:
+                def __init__(self, config, batch_size: int, **kwargs) -> None:
                     self.config = config
                     self.batch_size = batch_size
                     self.layers = []
+                    self.session_id = kwargs.get("session_id", config.session_id or "generated-session") or "generated-session"
 
             class FakeModel:
                 def __init__(self, config) -> None:
@@ -506,9 +475,10 @@ class LauncherTest(unittest.TestCase):
         seen: dict[str, object] = {}
 
         class FakeCache:
-            def __init__(self, config, batch_size: int) -> None:
+            def __init__(self, config, batch_size: int, **kwargs) -> None:
                 self.config = config
                 self.batch_size = batch_size
+                self.session_id = kwargs.get("session_id", config.session_id or "generated-session") or "generated-session"
 
         class FakeModel:
             def __init__(self, config) -> None:

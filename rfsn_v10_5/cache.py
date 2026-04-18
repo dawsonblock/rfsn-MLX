@@ -23,13 +23,14 @@ import json
 from pathlib import Path
 import shutil
 from typing import Any, Optional
+import uuid
 
 import numpy as np
 import mlx.core as mx
 
 from .attention_exact import AttentionSegment
 from .block_manager import BlockId, BlockLocation, BlockManager, BlockManifest, BlockSpan
-from .config import RFSNConfig, resolve_dtype
+from .config import RFSNConfig, RuntimeMode, resolve_dtype, validate_session_id
 from .residency import ResidencyManager
 from .storage import BlockStorage
 
@@ -55,6 +56,22 @@ def derive_model_id(config: RFSNConfig) -> str:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
+def _resolve_session_id(
+    config: RFSNConfig,
+    session_id: Optional[str],
+    *,
+    restore: bool,
+) -> str:
+    candidate = validate_session_id(session_id if session_id is not None else config.session_id)
+    if candidate:
+        return candidate
+    if restore:
+        raise ValueError(
+            "restore_cache requires an explicit session_id so the persisted archive can be resolved safely"
+        )
+    return uuid.uuid4().hex
+
+
 class LayerKVCache:
     """Exact KV cache for one transformer layer."""
 
@@ -67,6 +84,7 @@ class LayerKVCache:
         *,
         layer_id: int = 0,
         model_id: Optional[str] = None,
+        session_id: str,
     ) -> None:
         self.config = config
         self.batch_size = batch_size
@@ -74,6 +92,7 @@ class LayerKVCache:
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.layer_id = layer_id
         self.model_id = model_id or derive_model_id(config)
+        self.session_id = session_id
         self.dtype = resolve_dtype(config.model_dtype)
         self.storage_array_dtype = mx.float32 if self.dtype == mx.bfloat16 else self.dtype
 
@@ -91,13 +110,21 @@ class LayerKVCache:
         self.hot_head_index: int = 0
 
         self.block_manager = BlockManager(self.model_id)
-        layer_storage_dir = Path(config.disk_cache_dir) / self.model_id / f"layer_{layer_id}"
+        layer_storage_dir = Path(config.disk_cache_dir) / self.model_id / self.session_id / f"layer_{layer_id}"
         self.storage = BlockStorage(layer_storage_dir)
         self.residency_manager = ResidencyManager(
             prefetch_margin_tokens=max(1, config.block_size_seq // 2),
         )
         self._resident_blocks: dict[BlockId, tuple[mx.array, mx.array]] = {}
         self._block_serial: int = 0
+
+    @property
+    def model_root(self) -> Path:
+        return Path(self.config.disk_cache_dir) / self.model_id
+
+    @property
+    def session_root(self) -> Path:
+        return self.model_root / self.session_id
 
     @property
     def hot_write_index(self) -> int:
@@ -123,9 +150,29 @@ class LayerKVCache:
             self.storage.quarantine_dir.mkdir(parents=True, exist_ok=True)
 
     def restore_from_disk(self) -> list[BlockManifest]:
+        self.hot_k = mx.zeros(self.hot_k.shape, dtype=self.dtype)
+        self.hot_v = mx.zeros(self.hot_v.shape, dtype=self.dtype)
+        self.hot_seq_len = 0
+        self.hot_head_index = 0
+        self.hot_start = 0
         self.block_manager.clear()
         self._resident_blocks.clear()
-        return self.storage.rebuild_manager(self.block_manager)
+        manifests = self.storage.rebuild_manager(self.block_manager)
+        contiguous_end = 0
+        for manifest in manifests:
+            if manifest.residency == BlockLocation.MISSING or not manifest.materializable:
+                raise RuntimeError(
+                    f"Persisted archive for session '{self.session_id}' contains an unreadable block "
+                    f"at layer {self.layer_id}; restore cannot safely continue"
+                )
+            if manifest.logical_start != contiguous_end:
+                raise RuntimeError(
+                    f"Persisted archive for session '{self.session_id}' contains a gap at layer "
+                    f"{self.layer_id}: expected {contiguous_end}, found {manifest.logical_start}"
+                )
+            contiguous_end = manifest.logical_end
+        self.hot_start = contiguous_end
+        return manifests
 
     def _empty_context(self) -> tuple[mx.array, mx.array, int, int]:
         empty = mx.zeros(
@@ -180,7 +227,7 @@ class LayerKVCache:
             return self._empty_context()
         ks = [segment[0] for segment in segments]
         vs = [segment[1] for segment in segments]
-        start = segments[0][2]
+        start = int(segments[0][2])
         total_len = sum(segment[0].shape[2] for segment in segments)
         hot_k = ks[0] if len(ks) == 1 else mx.concatenate(ks, axis=2)
         hot_v = vs[0] if len(vs) == 1 else mx.concatenate(vs, axis=2)
@@ -321,6 +368,11 @@ class LayerKVCache:
             )
 
         projected = self.hot_seq_len + incoming_len
+        if self.config.runtime_mode == RuntimeMode.EXACT and projected > self.config.hot_capacity:
+            raise RuntimeError(
+                "runtime_mode='exact' keeps all live context in the hot window; "
+                f"the requested append would exceed hot_capacity={self.config.hot_capacity}"
+            )
         while projected > self.config.hot_capacity and self.hot_seq_len > 0:
             need = projected - self.config.hot_capacity
             chunk = max(need, self.config.block_size_seq)
@@ -394,7 +446,7 @@ class LayerKVCache:
                     raise RuntimeError(
                         f"Non-contiguous context: previous block end {previous_end}, next block start {current[2]}"
                     )
-        start = ordered[0][2]
+        start = int(ordered[0][2])
         full_k = ordered[0][0] if len(ordered) == 1 else mx.concatenate([segment[0] for segment in ordered], axis=2)
         full_v = ordered[0][1] if len(ordered) == 1 else mx.concatenate([segment[1] for segment in ordered], axis=2)
         return full_k, full_v, start, start + full_k.shape[2]
@@ -436,8 +488,18 @@ class LayerKVCache:
 class RFSNCache:
     """Wrapper for per-layer exact caches."""
 
-    def __init__(self, config: RFSNConfig, batch_size: int, *, model_id: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        config: RFSNConfig,
+        batch_size: int,
+        *,
+        model_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        restore: bool = False,
+    ) -> None:
+        self.config = config
         self.model_id = model_id or derive_model_id(config)
+        self.session_id = _resolve_session_id(config, session_id, restore=restore)
         self.layers = [
             LayerKVCache(
                 config,
@@ -446,9 +508,18 @@ class RFSNCache:
                 num_kv_heads=config.num_kv_heads,
                 layer_id=layer_index,
                 model_id=self.model_id,
+                session_id=self.session_id,
             )
             for layer_index in range(config.num_layers)
         ]
+
+    @property
+    def model_root(self) -> Path:
+        return Path(self.config.disk_cache_dir) / self.model_id
+
+    @property
+    def session_root(self) -> Path:
+        return self.model_root / self.session_id
 
     def layer(self, idx: int) -> LayerKVCache:
         return self.layers[idx]
@@ -458,4 +529,31 @@ class RFSNCache:
             layer_cache.reset(clear_persisted=clear_persisted)
 
     def restore_from_disk(self) -> list[list[BlockManifest]]:
-        return [layer_cache.restore_from_disk() for layer_cache in self.layers]
+        if not self.session_id:
+            raise ValueError(
+                "restore_cache requires an explicit session_id so the persisted archive can be resolved safely"
+            )
+        if not self.model_root.exists():
+            raise FileNotFoundError(
+                f"Restore requested for session '{self.session_id}' but no persisted archive exists "
+                f"for model '{self.model_id}'"
+            )
+        if not self.session_root.exists():
+            known_sessions = sorted(path.name for path in self.model_root.iterdir() if path.is_dir())
+            if known_sessions:
+                raise FileNotFoundError(
+                    f"Restore requested for unknown session '{self.session_id}' for model '{self.model_id}'. "
+                    f"Available sessions: {', '.join(known_sessions)}"
+                )
+            raise FileNotFoundError(
+                f"Restore requested for session '{self.session_id}' but no persisted archive exists "
+                f"for model '{self.model_id}'"
+            )
+
+        restored = [layer_cache.restore_from_disk() for layer_cache in self.layers]
+        restored_block_count = sum(len(layer_manifests) for layer_manifests in restored)
+        if restored_block_count == 0:
+            raise FileNotFoundError(
+                f"Restore requested for session '{self.session_id}' but the persisted archive is empty"
+            )
+        return restored

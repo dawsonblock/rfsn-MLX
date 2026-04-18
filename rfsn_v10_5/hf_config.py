@@ -87,13 +87,6 @@ def _resolve_head_dim(hidden_size: int, num_attention_heads: int, config_json: M
     return hidden_size // num_attention_heads
 
 
-def _resolve_subspace_layout(head_dim: int) -> tuple[int, int]:
-    for candidate_subspace_dim in (16, 8, 4, 2, 1):
-        if head_dim % candidate_subspace_dim == 0:
-            return head_dim // candidate_subspace_dim, candidate_subspace_dim
-    raise HFConfigError(f"Could not resolve a valid subspace layout for head_dim={head_dim}")
-
-
 def hf_config_to_rfsn_config(
     config_json: Mapping[str, Any],
     *,
@@ -101,9 +94,10 @@ def hf_config_to_rfsn_config(
     warm_capacity: int = 2048,
     cold_capacity: int = 8192,
     block_size_seq: int = 64,
-    runtime_mode: RuntimeMode = RuntimeMode.COMPRESSED,
+    runtime_mode: RuntimeMode = RuntimeMode.ARCHIVED,
     model_dtype: str = "bfloat16",
-    cache_dtype: str = "",
+    disk_cache_dir: str = "./rfsn_disk_cache",
+    session_id: str = "",
 ) -> RFSNConfig:
     family = detect_hf_family(config_json)
     hidden_size = _require_int(config_json, "hidden_size")
@@ -117,7 +111,6 @@ def hf_config_to_rfsn_config(
         )
 
     head_dim = _resolve_head_dim(hidden_size, num_attention_heads, config_json)
-    num_subspaces, subspace_dim = _resolve_subspace_layout(head_dim)
     vocab_size = _require_int(config_json, "vocab_size")
     norm_eps = _require_float(config_json, "rms_norm_eps", 1e-5)
     rope_theta = _require_float(config_json, "rope_theta", 10000.0)
@@ -132,8 +125,6 @@ def hf_config_to_rfsn_config(
         num_kv_heads=num_key_value_heads,
         head_dim=head_dim,
         num_layers=num_hidden_layers,
-        num_subspaces=num_subspaces,
-        subspace_dim=subspace_dim,
         hot_capacity=hot_capacity,
         warm_capacity=warm_capacity,
         cold_capacity=cold_capacity,
@@ -141,11 +132,12 @@ def hf_config_to_rfsn_config(
         runtime_mode=runtime_mode,
         vocab_size=vocab_size,
         max_position_embeddings=max_position_embeddings,
+        disk_cache_dir=disk_cache_dir,
+        session_id=session_id,
         rope_base=rope_theta,
         ffn_dim=intermediate_size,
         norm_eps=norm_eps,
         model_dtype=model_dtype,
-        cache_dtype=cache_dtype,
     )
 
 

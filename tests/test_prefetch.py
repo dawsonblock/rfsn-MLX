@@ -21,14 +21,12 @@ class PrefetchTest(unittest.TestCase):
                 head_dim=16,
                 num_layers=1,
                 vocab_size=128,
-                num_subspaces=4,
-                subspace_dim=4,
                 hot_capacity=4,
                 warm_capacity=4,
                 cold_capacity=32,
                 block_size_seq=4,
                 model_dtype="float16",
-                runtime_mode=RuntimeMode.COMPRESSED,
+                runtime_mode=RuntimeMode.ARCHIVED,
                 disk_cache_dir=tmpdir,
             )
             model = RFSNMLX(config)
