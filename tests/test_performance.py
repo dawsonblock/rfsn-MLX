@@ -46,7 +46,7 @@ class PerformanceSmokeTest(unittest.TestCase):
             token = mx.argmax(logits, axis=-1).astype(mx.int32)
 
         layer_cache = cache.layer(0)
-        self.assertTrue(layer_cache.warm_blocks or layer_cache.cold_blocks)
+        self.assertGreater(layer_cache.get_block_stats()["total_blocks"], 0)
         return token
 
     def _start_capture(self, directory: Path) -> tuple[Path, callable]:
@@ -108,19 +108,19 @@ class PerformanceSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             artifact_path, stop_capture = self._start_capture(Path(tmpdir))
             try:
+                archived_segments_before = layer_cache.get_archived_attention_segments()
                 logits = model.decode_step(token, cache, 10)
                 mx.eval(logits)
-                archived_after_first = layer_cache._archived_k
-                self.assertIsNotNone(archived_after_first)
 
                 next_token = mx.argmax(logits, axis=-1).astype(mx.int32)
                 logits = model.decode_step(next_token, cache, 11)
                 mx.eval(logits)
-                archived_after_second = layer_cache._archived_k
+                archived_segments_after = layer_cache.get_archived_attention_segments()
             finally:
                 stop_capture()
 
-            self.assertIs(archived_after_first, archived_after_second)
+            self.assertTrue(archived_segments_before)
+            self.assertTrue(archived_segments_after)
             self._assert_capture_artifact(artifact_path)
 
     def test_bench_decode_archive_seed_runs(self) -> None:

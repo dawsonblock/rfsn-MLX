@@ -217,6 +217,9 @@ class LayerKVCache:
     def _resident_payload_to_numpy(self, tensor: mx.array) -> np.ndarray:
         return np.asarray(tensor.astype(self.storage_array_dtype))
 
+    def _storage_dtype_name(self, tensor: mx.array) -> str:
+        return self._resident_payload_to_numpy(tensor).dtype.name
+
     def _spill_manifest_to_disk(self, manifest: BlockManifest) -> None:
         resident = self._resident_blocks.pop(manifest.block_id, None)
         if resident is None:
@@ -247,7 +250,11 @@ class LayerKVCache:
             logical_start=0,
             length=prefix_len,
         )
-        manifest = self._next_block_manifest(prefix_start, prefix_end, hot_k.dtype.name)
+        manifest = self._next_block_manifest(
+            prefix_start,
+            prefix_end,
+            self._storage_dtype_name(hot_k),
+        )
         self.block_manager.register_block(manifest)
         self._resident_blocks[manifest.block_id] = (hot_k, hot_v)
         self.hot_head_index = (self.hot_head_index + prefix_len) % self.config.hot_capacity
