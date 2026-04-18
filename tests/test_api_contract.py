@@ -3,70 +3,24 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-import mlx.core as mx
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from rfsn_v10_5.api import GenerateRequest, create_app
-from rfsn_v10_5.config import RFSNConfig
+from rfsn_v10_5.model import RFSNMLX
+from tests._helpers import FakeModel, FakeTokenizer, build_config
 
 
-class FakeTokenizer:
-    def __call__(self, text: str, add_special_tokens: bool = True):
-        return {"input_ids": [5, 6]}
-
-    def apply_chat_template(self, messages, *, tokenize: bool = False, add_generation_prompt: bool = False):
-        if tokenize:
-            return {"input_ids": [9, 10]}
-        return "chat-template"
-
-    def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
-        return "|".join(str(token_id) for token_id in token_ids)
-
-
-class FakeModel:
-    def __init__(self, config: RFSNConfig) -> None:
-        self.config = config
-
-    def generate(
-        self,
-        prompt_ids,
-        max_new_tokens: int,
-        cache=None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = 0,
-        repetition_penalty: float = 1.0,
-    ):
-        return [mx.array([7], dtype=mx.int32), mx.array([8], dtype=mx.int32)]
-
-    def prefill(self, prompt_ids, cache):
-        logits = mx.zeros((1, prompt_ids.shape[1], self.config.vocab_size), dtype=mx.float32)
-        logits[:, -1, 7] = 10.0
-        return logits
-
-    def decode_step(self, token, cache, pos: int):
-        logits = mx.zeros((1, self.config.vocab_size), dtype=mx.float32)
-        next_id = 8 if pos == 2 else 9
-        logits[:, next_id] = 10.0
-        return logits
-
-
-class APITest(unittest.TestCase):
+class APIContractTest(unittest.TestCase):
     def _build_app(self, **create_app_kwargs):
-        config = RFSNConfig(
-            hidden_dim=32,
-            num_heads=2,
-            num_kv_heads=2,
-            head_dim=16,
-            num_layers=1,
-            vocab_size=32,
-        )
+        config = create_app_kwargs.pop("config", build_config(vocab_size=32))
+        model = create_app_kwargs.pop("model", FakeModel(config))
+        tokenizer = create_app_kwargs.pop("tokenizer", FakeTokenizer())
         return create_app(
             config,
-            model=FakeModel(config),
-            tokenizer=FakeTokenizer(),
+            model=model,
+            tokenizer=tokenizer,
             **create_app_kwargs,
         )
 
@@ -152,6 +106,27 @@ class APITest(unittest.TestCase):
         self.assertEqual(exc_info.exception.status_code, 400)
         self.assertIn("session_id", exc_info.exception.detail)
 
+    def test_generate_endpoint_rejects_invalid_session_id(self) -> None:
+        app = self._build_app()
+        generate = self._get_route_endpoint(app, "/generate", "POST")
+
+        with self.assertRaises(HTTPException) as exc_info:
+            generate(GenerateRequest(prompt="Hello", max_new_tokens=2, session_id="bad/session"))
+
+        self.assertEqual(exc_info.exception.status_code, 400)
+        self.assertIn("session_id", exc_info.exception.detail)
+
+    def test_generate_endpoint_surfaces_runtime_bounds_as_bad_request(self) -> None:
+        config = build_config(vocab_size=32, max_position_embeddings=2)
+        app = self._build_app(config=config, model=RFSNMLX(config), tokenizer=None)
+        generate = self._get_route_endpoint(app, "/generate", "POST")
+
+        with self.assertRaises(HTTPException) as exc_info:
+            generate(GenerateRequest(prompt_ids=[1, 2], max_new_tokens=1))
+
+        self.assertEqual(exc_info.exception.status_code, 400)
+        self.assertIn("max_position_embeddings=2", exc_info.exception.detail)
+
     def test_generate_stream_endpoint_emits_token_and_complete_events(self) -> None:
         app = self._build_app()
         with TestClient(app) as client:
@@ -177,21 +152,7 @@ class APITest(unittest.TestCase):
         self.assertIn("prompt", exc_info.exception.detail)
 
     def test_generate_endpoint_rejects_overload_cleanly(self) -> None:
-        config = RFSNConfig(
-            hidden_dim=32,
-            num_heads=2,
-            num_kv_heads=2,
-            head_dim=16,
-            num_layers=1,
-            vocab_size=32,
-        )
-        app = create_app(
-            config,
-            model=FakeModel(config),
-            tokenizer=FakeTokenizer(),
-            max_concurrent_requests=1,
-            max_queue_size=0,
-        )
+        app = self._build_app(max_concurrent_requests=1, max_queue_size=0)
         generate = self._get_route_endpoint(app, "/generate", "POST")
 
         admission_context = app.state.service.admission.admit()

@@ -7,41 +7,19 @@ from pathlib import Path
 
 import numpy as np
 
-from rfsn_v10_5.block_manager import (
-    BlockId,
-    BlockLocation,
-    BlockManager,
-    BlockManifest,
-    BlockSpan,
-)
+from rfsn_v10_5.block_manager import BlockLocation, BlockManager
+from rfsn_v10_5.cache import RFSNCache
 from rfsn_v10_5.storage import BlockStorage
+from tests._helpers import build_config, build_manifest, build_payload
 
 
-class ColdStorageIntegrityTest(unittest.TestCase):
-    def _manifest(self, block_name: str, start: int = 0, end: int = 4) -> BlockManifest:
-        return BlockManifest(
-            block_id=BlockId("model-a", 0, block_name),
-            span=BlockSpan(start, end),
-            codec_version="v11-exact-kv",
-            dtype="float32",
-            shape_metadata={
-                "keys": (1, 1, end - start, 2),
-                "values": (1, 1, end - start, 2),
-            },
-            residency=BlockLocation.COLD_DISK,
-        )
-
-    def _payload(self, token_count: int) -> dict[str, np.ndarray]:
-        keys = np.arange(token_count * 2, dtype=np.float32).reshape(1, 1, token_count, 2)
-        values = (keys + 100.0).astype(np.float32)
-        return {"keys": keys, "values": values}
-
+class ArchiveIntegrityTest(unittest.TestCase):
     def test_persist_and_restart_rebuild_restore_manifest_and_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = BlockStorage(tmpdir)
             manager = BlockManager("model-a")
-            manifest = self._manifest("blk0")
-            payload = self._payload(manifest.token_count)
+            manifest = build_manifest("model-a")
+            payload = build_payload(manifest.token_count)
 
             storage.persist_block(manifest, payload)
             manager.register_block(manifest)
@@ -64,9 +42,9 @@ class ColdStorageIntegrityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = BlockStorage(tmpdir)
             manager = BlockManager("model-a")
-            manifest = self._manifest("blk-missing")
+            manifest = build_manifest("model-a", block_name="blk-missing")
 
-            storage.persist_block(manifest, self._payload(manifest.token_count))
+            storage.persist_block(manifest, build_payload(manifest.token_count))
             manager.register_block(manifest)
             assert manifest.payload_path is not None
             Path(manifest.payload_path).unlink()
@@ -84,9 +62,9 @@ class ColdStorageIntegrityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = BlockStorage(tmpdir)
             manager = BlockManager("model-a")
-            manifest = self._manifest("blk-bad-checksum")
+            manifest = build_manifest("model-a", block_name="blk-bad-checksum")
 
-            storage.persist_block(manifest, self._payload(manifest.token_count))
+            storage.persist_block(manifest, build_payload(manifest.token_count))
             manager.register_block(manifest)
             assert manifest.payload_path is not None
             Path(manifest.payload_path).write_bytes(b"tampered-payload")
@@ -106,9 +84,9 @@ class ColdStorageIntegrityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = BlockStorage(tmpdir)
             manager = BlockManager("model-a")
-            manifest = self._manifest("blk-bad-npz")
+            manifest = build_manifest("model-a", block_name="blk-bad-npz")
 
-            storage.persist_block(manifest, self._payload(manifest.token_count))
+            storage.persist_block(manifest, build_payload(manifest.token_count))
             manager.register_block(manifest)
 
             invalid_payload = b"not-a-valid-npz"
@@ -127,6 +105,34 @@ class ColdStorageIntegrityTest(unittest.TestCase):
             self.assertFalse(manager.get_block(manifest.block_id).materializable)
             assert failure_reason is not None
             self.assertIn("deserialization failed", failure_reason)
+
+    def test_restore_rejects_gap_in_persisted_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = build_config(disk_cache_dir=tmpdir, session_id="gap-session")
+            cache = RFSNCache(config, batch_size=1)
+            layer_cache = cache.layer(0)
+
+            first = build_manifest(cache.model_id, block_name="blk0", start=0, end=4)
+            second = build_manifest(cache.model_id, block_name="blk1", start=8, end=12)
+            layer_cache.storage.persist_block(first, build_payload(first.token_count))
+            layer_cache.storage.persist_block(second, build_payload(second.token_count))
+
+            with self.assertRaisesRegex(RuntimeError, "contains a gap"):
+                RFSNCache(config, batch_size=1, restore=True).restore_from_disk()
+
+    def test_restore_rejects_unreadable_persisted_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = build_config(disk_cache_dir=tmpdir, session_id="bad-archive")
+            cache = RFSNCache(config, batch_size=1)
+            layer_cache = cache.layer(0)
+
+            manifest = build_manifest(cache.model_id, block_name="blk0", start=0, end=4)
+            layer_cache.storage.persist_block(manifest, build_payload(manifest.token_count))
+            assert manifest.payload_path is not None
+            Path(manifest.payload_path).unlink()
+
+            with self.assertRaisesRegex(RuntimeError, "contains an unreadable block"):
+                RFSNCache(config, batch_size=1, restore=True).restore_from_disk()
 
 
 if __name__ == "__main__":

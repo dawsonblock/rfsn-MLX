@@ -1,8 +1,8 @@
 # rfsn-MLX
 
-An MLX-native transformer inference engine for Apple Silicon with exact retained-context semantics, disk-backed KV paging, corruption-safe block storage, grouped-query attention, and tokenizer-backed CLI/API surfaces.
+An MLX-native transformer inference engine for Apple Silicon with exact retained-context semantics, exact archived KV spill, session-scoped restart restore, corruption-safe block storage, grouped-query attention, and tokenizer-backed CLI/API surfaces.
 
-> Status: the V11 exact block-managed runtime is implemented. Long-context spill/reload, restart restoration, chunked prefill, HF config auto-loading, chat-template message input, and a thin single-request FastAPI wrapper are in place. Continuous batching, explicit session management, and custom Metal kernels remain future work.
+> Status: the V11 exact block-managed runtime is implemented. Exact hot-window mode, exact archived spill/reload, session-scoped restart restoration, chunked prefill, HF config auto-loading, chat-template message input, and a thin single-request FastAPI wrapper are in place. Continuous batching and custom Metal kernels remain future work.
 
 ## Highlights
 
@@ -11,7 +11,7 @@ An MLX-native transformer inference engine for Apple Silicon with exact retained
 | Exact segmented attention | The active runtime path uses exact attention over archived segments plus the hot window | Preserves retained-context semantics without lossy reconstruction on the hot path |
 | Block-managed archive | Hot KV overflow is sealed into exact archived blocks tracked by a page table | Makes long-context residency explicit and inspectable |
 | Corruption-safe persistence | Archived blocks are stored as `.npz` payloads plus checksummed manifests | Missing or corrupt cold blocks do not take down the runtime |
-| Restart restoration | Persisted blocks can be rebuilt into a fresh cache when config/model identity match | Lets long-context work survive process restarts |
+| Session-scoped restoration | Persisted blocks are rebuilt only for an explicit session ID under a matching model identity | Prevents cross-session archive bleed and makes restore intent explicit |
 | GQA support | `num_kv_heads` can be smaller than `num_heads` | Matches modern LLM attention layouts |
 | Decode-path optimization | Attention consumes cached segments directly instead of rebuilding a monolithic archive tensor every token | Removes a major per-token reconstruction cost |
 | Benchmarking | Built-in smoke checks plus prefill/decode timing helpers | Makes regressions easy to catch locally |
@@ -61,11 +61,11 @@ This project is best thought of as an inference-systems playground with real eng
 - exact short-context inference
 - exact long-context inference once hot capacity is exceeded
 - disk-backed KV persistence with corruption handling and restart restoration
-- experimentation with cache storage dtypes separate from model dtypes
+- session-scoped archived-context persistence and restart restore
 - loading HuggingFace-style LLaMA/Mistral checkpoints
 - benchmarking prefill and decode behavior on Apple Silicon
 
-It is not currently a full serving stack. A thin HTTP API and tokenizer-backed CLI are included, but there is still no request batching layer, scheduler, distributed runtime, or explicit multi-session cache manager. The repo still contains older codec-related modules for experimentation, but the V11 runtime path is the exact block-managed archive.
+It is not currently a full serving stack. A thin HTTP API and tokenizer-backed CLI are included, but there is still no request batching layer, scheduler, or distributed runtime. The repo now exposes only the exact block-managed archive path.
 
 ## Requirements
 
@@ -111,13 +111,12 @@ If you only need random-weight smoke checks and do not plan to load checkpoints,
 
 ```bash
 python -m rfsn_v10_5.launcher check
-python -m rfsn_v10_5.launcher check --cache-dtype fp8_e4m3
 ```
 
 Expected shape of the output:
 
 ```text
-[check] Config: dtype=float32, cache_dtype=fp8_e4m3
+[check] Config: dtype=float32, runtime_mode=archived, session_id=<generated>
 [check] Prefill OK, logits shape: (1, 8, 1000)
 [check] Decode OK, 5 steps completed
 [check] PASS
@@ -137,14 +136,13 @@ python -m rfsn_v10_5.launcher bench \
   --decode-steps 8 \
   --warmup 1 \
   --repeats 1 \
-  --model-dtype float16 \
-  --cache-dtype fp8_e4m3
+  --model-dtype float16
 ```
 
 Example output from the tiny validation configuration used in this workspace:
 
 ```text
-[bench] Model: 1L x 128d, 2H/2KVH, dtype=float16, cache_dtype=fp8_e4m3
+[bench] Model: 1L x 128d, 2H/2KVH, dtype=float16, runtime_mode=archived, session_id=<generated>
 prefill(len=8): mean=2.1ms  min=2.1ms  max=2.1ms  throughput=3773.1 tok/s
 decode(steps=8): mean=13.6ms  min=13.6ms  max=13.6ms  throughput=587.6 tok/s
 ```
@@ -166,11 +164,11 @@ python -m rfsn_v10_5.launcher generate \
   --ffn-dim 14336 \
   --rope-base 500000 \
   --prompt "Once upon a time" \
+  --session-id story-session \
   --max-new-tokens 64 \
   --temperature 0.8 \
   --top-p 0.95 \
-  --top-k 50 \
-  --cache-dtype fp8_e4m3
+  --top-k 50
 ```
 
 Notes:
@@ -182,6 +180,7 @@ Notes:
 - `--prompt-ids` remains available as the low-level escape hatch when you already have token IDs.
 - `--disk-cache-dir` controls where archived KV blocks are persisted.
 - `--restore-cache` restores persisted KV blocks from `--disk-cache-dir` before generation; use it only when the supplied input is continuation context, not a replayed full prompt.
+- `--session-id` is required together with `--restore-cache`. If you do not provide one for a fresh request, the launcher generates a new session ID and prints it.
 - Some checkpoints need non-default architecture settings such as `--ffn-dim` or `--rope-base`; use the checkpoint's `config.json` values when they differ from the defaults.
 - Text prompts require `--tokenizer`; otherwise use `--prompt-ids` directly.
 - The `bench` subcommand uses random weights; only `generate` needs a checkpoint.
@@ -228,6 +227,7 @@ Response body:
   "vocab_size": 32000,
   "max_position_embeddings": 131072,
   "disk_cache_dir": "./rfsn_disk_cache",
+  "default_session_id": null,
   "tokenizer_loaded": true,
   "admission_control": {
     "max_concurrent_requests": 1,
@@ -247,6 +247,7 @@ Request body:
   "prompt": "Once upon a time",
   "messages": [{"role": "user", "content": "Once upon a time"}],
   "prompt_ids": [1, 2, 3],
+  "session_id": "story-session",
   "restore_cache": false,
   "max_new_tokens": 32,
   "temperature": 0.8,
@@ -260,6 +261,7 @@ Use either `prompt` or `prompt_ids`. Response body:
 
 ```json
 {
+  "session_id": "story-session",
   "prompt_token_count": 4,
   "generated_token_count": 32,
   "token_ids": [1, 2, 3, 4, 5],
@@ -268,14 +270,14 @@ Use either `prompt` or `prompt_ids`. Response body:
 }
 ```
 
-Use one of `prompt`, `messages`, or `prompt_ids`. Set `restore_cache` only when the supplied input should be appended to persisted context already stored in `disk_cache_dir`.
+Use one of `prompt`, `messages`, or `prompt_ids`. Set `restore_cache` only when the supplied input should be appended to persisted context already stored in `disk_cache_dir`. `session_id` is required for restore and optional for fresh requests.
 
 `POST /generate/stream`
 
 The request body matches `/generate`. The route emits Server-Sent Events with:
 
 - `token`: `{"step": 1, "token_id": 7, "text": "hello"}`
-- `complete`: `{"token_ids": [...], "generated_token_count": 32, "text": "...", "generated_text": "..."}`
+- `complete`: `{"session_id": "story-session", "token_ids": [...], "generated_token_count": 32, "text": "...", "generated_text": "..."}`
 
 The streaming route emits Server-Sent Events. It is still single-request-at-a-time inference and does not implement continuous batching.
 
@@ -295,9 +297,9 @@ config = RFSNConfig(
     head_dim=64,
     num_layers=4,
     vocab_size=32000,
-    runtime_mode=RuntimeMode.COMPRESSED,
+  runtime_mode=RuntimeMode.ARCHIVED,
     model_dtype="bfloat16",
-    cache_dtype="fp8_e4m3",
+  session_id="python-session",
 )
 
 model = RFSNMLX(config)
@@ -370,7 +372,8 @@ config = RFSNConfig(
   head_dim=64,
   num_layers=4,
   vocab_size=32000,
-  runtime_mode=RuntimeMode.COMPRESSED,
+  runtime_mode=RuntimeMode.ARCHIVED,
+  session_id="service-default",
 )
 
 app = create_app(
@@ -389,7 +392,6 @@ Send `restore_cache: true` in a `/generate` or `/generate/stream` request when y
 `RFSNConfig` validates several constraints up front:
 
 - `hidden_dim == num_heads * head_dim`
-- `num_subspaces * subspace_dim == head_dim`
 - `hot_capacity <= warm_capacity <= cold_capacity`
 - `num_heads % num_kv_heads == 0`
 - `block_size_seq > 0`
@@ -398,25 +400,21 @@ Send `restore_cache: true` in a `/generate` or `/generate/stream` request when y
 
 | Field | Meaning |
 | --- | --- |
-| `runtime_mode` | Compatibility enum retained on `RFSNConfig`; the active V11 runtime always executes exact segmented attention over block-managed archived context |
+| `runtime_mode` | `exact` keeps all live context in the hot window; `archived` spills exact sealed prefixes into archived blocks |
 | `model_dtype` | Weight and activation dtype for the model path |
-| `cache_dtype` | Compatibility/storage knob retained on the config and CLI; the active exact archive path persists exact payloads using the model/runtime dtype |
 | `num_kv_heads` | Enables grouped-query attention when smaller than `num_heads` |
 | `hot_capacity` | Max tokens kept device-resident per layer |
 | `warm_capacity` | Max archived tokens kept in RAM before spilling blocks onward |
 | `cold_capacity` | Maximum retained archived tokens across disk-tier blocks; excess cold blocks are pruned |
-| `block_size_seq` | Eviction/compression granularity |
+| `block_size_seq` | Archival sealing granularity |
 | `disk_cache_dir` | Root directory for persisted archived KV blocks and their manifests |
-| `rvq_max_active` | Fixed-width budget for archived RVQ residual entries |
+| `session_id` | Explicit archive namespace. Required for restore, optional for new sessions |
 
-### Choosing cache dtypes
+### Session semantics
 
-- `float16`: good default for low memory use with minimal complexity
-- `bfloat16`: safer numeric range on supported workloads
-- `float32`: easiest debug mode
-- `fp8_e4m3`: one-byte cache storage, implemented as native float8 if MLX exposes it or as a packed `uint8` software fallback otherwise
-
-The FP8 path is a cache-storage optimization, not a full-model FP8 execution path.
+- Fresh CLI/API requests can omit `session_id`; a new one is generated and surfaced in the response/output.
+- Restore requires an explicit `session_id`.
+- Persisted archives live under `disk_cache_dir / model_id / session_id / layer_*`, so different sessions for the same model do not see each other's archived context.
 
 ## Repository layout
 
@@ -424,14 +422,11 @@ The FP8 path is a cache-storage optimization, not a full-model FP8 execution pat
 rfsn_v10_5/
   __init__.py
   api.py
-  attention_compressed.py
   attention_exact.py
   bench.py
   block_manager.py
   cache.py
-  codec.py
   config.py
-  fp8.py
   hf_config.py
   launcher.py
   layer.py
@@ -440,10 +435,9 @@ rfsn_v10_5/
   residency.py
   storage.py
   tokenizer_utils.py
-  types.py
 tests/
+  test_archived_runtime.py
   test_api.py
-  test_cache_dtype.py
   test_cold_tier_gc.py
   test_launcher.py
   test_performance.py
@@ -453,11 +447,9 @@ tests/
 Module roles:
 
 - `config.py`: validated runtime and architecture config
-- `cache.py`: hot/warm/cold KV cache, eviction, archive reuse, FP8 storage plumbing
+- `cache.py`: hot/warm/cold KV cache, archival spill, session-scoped restore, and exact segment materialization
 - `api.py`: thin FastAPI wrapper with blocking and SSE-style generation endpoints
-- `codec.py`: PQ + RVQ encoding and decode helpers for archived keys
 - `attention_exact.py`: exact attention and segmented attention utilities
-- `attention_compressed.py`: mixed archived + hot attention path
 - `layer.py`: per-layer projections, cache updates, attention routing, SwiGLU FFN
 - `model.py`: full model orchestration, prefill, decode, generation
 - `loader.py`: checkpoint remapping and loading
@@ -469,24 +461,26 @@ Module roles:
 Run the focused regression suite:
 
 ```bash
-python -m unittest tests.test_api tests.test_launcher tests.test_tokenizer_utils tests.test_cold_tier_gc tests.test_cache_dtype tests.test_performance
+python -m unittest tests.test_api tests.test_archived_runtime tests.test_launcher tests.test_tokenizer_utils tests.test_cold_tier_gc tests.test_performance
 ```
 
 What these tests cover:
 
 - FastAPI health, blocking generate, and SSE stream routes
-- launcher config plumbing and smoke command behavior
-- packed FP8 hot-cache storage and round-trip correctness
-- archived warm/cold payload storage in compact `uint8` form
+- launcher config plumbing, session handling, and smoke command behavior
+- exact archived warm/cold payload storage and restart restoration
 - combined archived-context cache reuse across decode steps
 - cold-tier file deletion and retained-context pruning once `cold_capacity` is exceeded
 - archived decode performance smoke path, including capture-artifact fallback when the runtime lacks usable profiling hooks
+
+See `HARDENING_NOTES.md` for a concise summary of the contract cleanup, session model, and manual verification points.
 
 ## Current limitations
 
 - Apple Silicon only, because MLX is the execution backend.
 - No checkpoint-specific tokenizer assets or chat templates are bundled in-repo.
-- Compressed prefill for a single prompt chunk larger than `hot_capacity` is not implemented; large prompts should be chunked before prefill.
+- `runtime_mode=exact` is intentionally hot-window only and raises if prefill or decode would exceed `hot_capacity`.
+- Restore requires an explicit `session_id` and a previously persisted archived context for that session.
 - The profiling/capture smoke path falls back to a text artifact on runtimes where `mx.profiler` or Metal capture cannot start.
 - `cold_capacity` now prunes the least-recently-used retained cold archive, which means the oldest retained context may be truncated once the disk-tier budget is exceeded.
 - This repo focuses on inference; there is no training or fine-tuning pipeline.
